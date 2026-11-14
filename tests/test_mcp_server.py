@@ -391,8 +391,7 @@ def test_mcp_stdlib_catalog() -> None:
     assert "mul_bps_floor" in fin_payload["modules"][0]["source"]
 
 
-@pytest.mark.parametrize("plugin_dir", [REPO_PLUGIN, INSTALLED_PLUGIN], ids=["repo", "installed"])
-def test_antigravity_plugin_schema_and_files(plugin_dir: Path) -> None:
+def _validate_plugin_bundle(plugin_dir: Path) -> dict:
     assert plugin_dir.is_dir(), f"Missing plugin dir: {plugin_dir}"
 
     plugin_json_path = plugin_dir / "plugin.json"
@@ -420,8 +419,8 @@ def test_antigravity_plugin_schema_and_files(plugin_dir: Path) -> None:
     assert mcp_cfg_path.is_file()
     mcp_cfg = json.loads(mcp_cfg_path.read_text(encoding="utf-8"))
     srv = mcp_cfg["mcpServers"]["ailang-mcp"]
-    assert srv["command"] == "/opt/homebrew/bin/uv"
-    assert srv["args"] == ["--directory", "/Users/nunoribeiro/repos/ailang", "run", "ail", "mcp"]
+    assert srv["command"].endswith("uv")
+    assert "ail" in srv["args"] and "mcp" in srv["args"]
 
     skill_path = plugin_dir / "skills" / "ailang" / "SKILL.md"
     assert skill_path.is_file()
@@ -440,11 +439,29 @@ def test_antigravity_plugin_schema_and_files(plugin_dir: Path) -> None:
     rules_text = rules_path.read_text(encoding="utf-8")
     assert not rules_text.startswith("---"), "rules/AGENTS.md must be plain markdown without YAML frontmatter"
     assert "ail_check_and_prove" in rules_text
+    return srv
+
+
+def test_antigravity_plugin_schema_and_files() -> None:
+    srv = _validate_plugin_bundle(REPO_PLUGIN)
+    assert srv["command"] == "uv"
+    assert srv["args"] == ["run", "ail", "mcp"]
 
 
 def test_repo_and_installed_plugins_match_exactly() -> None:
+    if not INSTALLED_PLUGIN.is_dir():
+        return
+
+    srv = _validate_plugin_bundle(INSTALLED_PLUGIN)
+    args = srv["args"]
+    assert "--directory" in args
+    dir_idx = args.index("--directory")
+    assert dir_idx + 1 < len(args) and Path(args[dir_idx + 1]).resolve() == ROOT.resolve()
+
     repo_files = sorted(p.relative_to(REPO_PLUGIN) for p in REPO_PLUGIN.rglob("*") if p.is_file())
     inst_files = sorted(p.relative_to(INSTALLED_PLUGIN) for p in INSTALLED_PLUGIN.rglob("*") if p.is_file())
     assert repo_files == inst_files
     for rel in repo_files:
+        if rel == Path("mcp_config.json"):
+            continue
         assert (REPO_PLUGIN / rel).read_bytes() == (INSTALLED_PLUGIN / rel).read_bytes(), f"Mismatch in {rel}"

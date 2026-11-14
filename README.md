@@ -189,7 +189,24 @@ Exposed MCP tools:
 4. `ail_compile_target` — Compile verified `.ail` source/path to `native`, `wasm`, `c`, `rust`, or `all`.
 5. `ail_stdlib_catalog` — Inspect built-in `src/ailang/stdlib/*.ail` modules and signatures.
 
-The matching Antigravity plugin bundle lives in [integrations/antigravity-plugin/](integrations/antigravity-plugin/) (`plugin.json`, `mcp_config.json`, `assets/logo.svg`, `skills/ailang/SKILL.md`, `agents/ail-kernel-synthesizer.md`, `rules/AGENTS.md`).
+The matching Antigravity plugin bundle lives in [integrations/antigravity-plugin/](integrations/antigravity-plugin/) (`plugin.json`, `mcp_config.json`, `assets/logo.svg`, `skills/ailang/SKILL.md`, `agents/ail-kernel-synthesizer.md`, `rules/AGENTS.md`). To install it locally for Antigravity from any workspace, copy the bundle to `~/.gemini/config/plugins/ailang/` and point `mcp_config.json` at your cloned repository path:
+
+```bash
+cp -R integrations/antigravity-plugin ~/.gemini/config/plugins/ailang
+```
+
+Then update `~/.gemini/config/plugins/ailang/mcp_config.json` with `"--directory", "/abs/path/to/ailang"`:
+
+```json
+{
+  "mcpServers": {
+    "ailang-mcp": {
+      "command": "uv",
+      "args": ["--directory", "/abs/path/to/ailang", "run", "ail", "mcp"]
+    }
+  }
+}
+```
 
 ---
 
