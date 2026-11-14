@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import Any
 from google.protobuf import text_format
 
 from ailang import ail_agent_pb2 as pb
@@ -33,6 +34,9 @@ REPAIR_HINTS: dict[int, str] = {
     pb.E_SPEC_AMBIGUITY: "Candidate specs disagree on the distinguishing input witness; resolve edge-case policy before codegen.",
     pb.E_I64_OVERFLOW: "Signed 64-bit operation can exceed `[MIN_I64..MAX_I64]` (or trigger `MIN_I64 / -1`); clamp or tighten `i64[lo..hi]` bounds.",
     pb.E_STRUCT_INVARIANT_FAILED: "Field values passed to `(make StructName ...)` violate the struct's dependent field refinement bounds.",
+    pb.E_NON_EXHAUSTIVE_MATCH: "Add match arms covering every variant of the enum (or add a trailing wildcard `(_ ...)` arm).",
+    pb.E_DUPLICATE_MATCH_ARM: "Remove duplicate variant names in `(enum ...)` or duplicate match pattern arms.",
+    pb.E_ENUM_INVARIANT_FAILED: "Field values passed to `(variant EnumName VariantName ...)` violate the variant's dependent field refinement bounds.",
 }
 
 
@@ -140,11 +144,11 @@ def make_diagnostic(
     )
 
 
-def to_prototext(msg: pb.CompilerResponse | pb.RepairSession) -> str:
+def to_prototext(msg: Any) -> str:
     return text_format.MessageToString(msg, as_one_line=False)
 
 
-def to_proto_bytes(msg: pb.CompilerResponse | pb.RepairSession) -> bytes:
+def to_proto_bytes(msg: Any) -> bytes:
     return msg.SerializeToString()
 
 

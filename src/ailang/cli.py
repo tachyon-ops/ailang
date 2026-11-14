@@ -10,6 +10,8 @@ import time
 from ailang import ail_agent_pb2 as pb
 from ailang.agent_loop import run_repair_session
 from ailang.codegen_llvm import compile_llvm_to_native
+from ailang.lang_bench import format_language_benchmark_markdown, run_language_benchmark
+from ailang.llm_bench import run_llm_benchmark
 from ailang.diagnostics import (
     AILCompilerError,
     format_human_summary,
@@ -47,6 +49,21 @@ def _emit_repair_session(sess: pb.RepairSession, fmt: str, proto_out: str | None
     else:
         print(format_repair_session(sess))
     return 0 if sess.final_status == pb.STATUS_VERIFIED else 1
+
+
+def _emit_generic_proto(msg: object, text_summary: str, fmt: str, proto_out: str | None = None) -> int:
+    if proto_out:
+        out_path = Path(proto_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(to_proto_bytes(msg))
+    if fmt == "proto":
+        sys.stdout.buffer.write(to_proto_bytes(msg))
+        sys.stdout.buffer.flush()
+    elif fmt == "prototext":
+        sys.stdout.write(to_prototext(msg))
+    else:
+        print(text_summary)
+    return 0
 
 
 def check_and_verify_path(path: Path) -> tuple[pb.CompilerResponse, list[SNode], ModuleTypeEnv]:
@@ -119,6 +136,19 @@ def main(argv: list[str] | None = None) -> int:
     p_rep.add_argument("--max-iters", type=int, default=8, help="Maximum repair loop turns (default: 8)")
     p_rep.add_argument("--backend", choices=["deterministic", "gemini"], default="deterministic", help="Repair backend")
     p_rep.add_argument("--no-tight-specs", action="store_true", help="Skip SpecMut tightness enforcement during repair")
+
+    p_bl = sub.add_parser("bench-langs", help="Run empirical benchmark comparing AIL vs Rust vs C vs Python")
+    p_bl.add_argument("-o", "--out-dir", type=Path, default=Path("build/bench_langs"), help="Working build directory")
+    p_bl.add_argument("--scalar-iters", type=int, default=2_000_000, help="Iterations for scalar/array kernels")
+    p_bl.add_argument("--simd-iters", type=int, default=100_000, help="Iterations for SIMD/matrix kernels")
+    p_bl.add_argument("--markdown-out", type=Path, default=None, help="Optional path to save Markdown benchmark report")
+
+    p_bllm = sub.add_parser("bench-llm", help="Run blind LLM spec-to-silicon benchmark suite")
+    p_bllm.add_argument("-o", "--out-dir", type=Path, default=Path("build/bench_llm"), help="Working build directory")
+    p_bllm.add_argument("--provider", default="gemini", help="LLM provider backend")
+    p_bllm.add_argument("--model", default="gemini-2.5-flash", help="Model name")
+    p_bllm.add_argument("--max-turns", type=int, default=4, help="Maximum self-repair turns per task")
+    p_bllm.add_argument("--markdown-out", type=Path, default=None, help="Optional path to save Markdown benchmark report")
 
     args = parser.parse_args(argv)
 
@@ -208,6 +238,31 @@ def main(argv: list[str] | None = None) -> int:
             args.write_ast.parent.mkdir(parents=True, exist_ok=True)
             args.write_ast.write_bytes(sess.repaired_ast.SerializeToString())
         return _emit_repair_session(sess, args.format, args.proto_out)
+
+    if args.cmd == "bench-langs":
+        report, md = run_language_benchmark(
+            args.out_dir,
+            scalar_iters=args.scalar_iters,
+            simd_iters=args.simd_iters,
+        )
+        if not md:
+            md = format_language_benchmark_markdown(report)
+        if args.markdown_out:
+            args.markdown_out.parent.mkdir(parents=True, exist_ok=True)
+            args.markdown_out.write_text(md)
+        return _emit_generic_proto(report, md, args.format, args.proto_out)
+
+    if args.cmd == "bench-llm":
+        report, md = run_llm_benchmark(
+            args.out_dir,
+            provider=args.provider,
+            model_name=args.model,
+            max_turns=args.max_turns,
+        )
+        if args.markdown_out:
+            args.markdown_out.parent.mkdir(parents=True, exist_ok=True)
+            args.markdown_out.write_text(md)
+        return _emit_generic_proto(report, md, args.format, args.proto_out)
 
     return 1
 

@@ -8,7 +8,7 @@ import subprocess
 
 from ailang import ail_agent_pb2 as pb
 from ailang.diagnostics import I64_MAX, I64_MIN, U64_MAX
-from ailang.ownership import LINEAR_CAPS, FnSig, ModuleTypeEnv, StructDef, check_module_ownership_v2
+from ailang.ownership import EnumDef, LINEAR_CAPS, FnSig, ModuleTypeEnv, StructDef, check_module_ownership_v2
 from ailang.parser import SNode
 
 
@@ -45,6 +45,8 @@ class ExportedSymbol:
 def _ir_type_for_kind(kind: str) -> str:
     if kind.startswith("struct:"):
         return f"%struct.{kind.split(':', 1)[1]}"
+    if kind.startswith("enum:"):
+        return f"%enum.{kind.split(':', 1)[1]}"
     if kind == "bool":
         return "i1"
     return "i64"
@@ -163,8 +165,87 @@ class FunctionIREmitter:
             self.lines.append(f"  {r} = extractvalue %struct.{sname} {sreg}, {fidx}")
             return r
 
+        if op == "variant":
+            ename = str(items[1].val)
+            vname = str(items[2].val)
+            vdef = self.tenv.enums[ename].get_variant(vname)
+            assert vdef is not None
+            ir_ety = f"%enum.{ename}"
+            cur_agg = self.tmp()
+            self.lines.append(f"  {cur_agg} = insertvalue {ir_ety} zeroinitializer, i64 {vdef.tag}, 0")
+            for idx, arg_n in enumerate(items[3:]):
+                fval = self.emit_expr(arg_n, env)
+                nxt = self.tmp()
+                self.lines.append(f"  {nxt} = insertvalue {ir_ety} {cur_agg}, i64 {fval}, {idx + 1}")
+                cur_agg = nxt
+            return cur_agg
+
+        if op == "is_variant":
+            sv_node = items[1]
+            ename = self._node_kind(sv_node).split(":", 1)[1]
+            vdef = self.tenv.enums[ename].get_variant(str(items[2].val))
+            assert vdef is not None
+            sreg = self.emit_expr(sv_node, env)
+            tag_r = self.tmp()
+            cmp_r = self.tmp()
+            self.lines.append(f"  {tag_r} = extractvalue %enum.{ename} {sreg}, 0")
+            self.lines.append(f"  {cmp_r} = icmp eq i64 {tag_r}, {vdef.tag}")
+            return cmp_r
+
+        if op == "match":
+            scrut_n = items[1]
+            ename = self._node_kind(scrut_n).split(":", 1)[1]
+            edef = self.tenv.enums[ename]
+            ir_ety = f"%enum.{ename}"
+            sreg = self.emit_expr(scrut_n, env)
+            tag_r = self.tmp()
+            self.lines.append(f"  {tag_r} = extractvalue {ir_ety} {sreg}, 0")
+
+            arms = items[2:]
+            arm_lbls = [self.label(f"marm{i}") for i in range(len(arms))]
+            merge_lbl = self.label("mmerge")
+
+            switch_cases: list[str] = []
+            for arm, lbl in zip(arms[:-1], arm_lbls[:-1]):
+                pat = arm.val[0]
+                vdef = edef.get_variant(str(pat.val[0].val))
+                assert vdef is not None
+                switch_cases.append(f"i64 {vdef.tag}, label %{lbl}")
+            self.lines.append(f"  switch i64 {tag_r}, label %{arm_lbls[-1]} [ {' '.join(switch_cases)} ]")
+
+            arm_results: list[tuple[str, str]] = []
+            for arm, lbl in zip(arms, arm_lbls):
+                pat, arm_body = arm.val[0], arm.val[1]
+                self.lines.append(f"{lbl}:")
+                self.cur_block = lbl
+                arm_env = dict(env)
+                if not (isinstance(pat.val, str) and pat.val == "_"):
+                    vdef = edef.get_variant(str(pat.val[0].val))
+                    assert vdef is not None
+                    for fidx, (bnode, fd) in enumerate(zip(pat.val[1:], vdef.fields)):
+                        bname = str(bnode.val)
+                        self.var_kinds[bname] = fd.kind
+                        freg = self.tmp()
+                        self.lines.append(f"  {freg} = extractvalue {ir_ety} {sreg}, {fidx + 1}")
+                        arm_env[bname] = freg
+                av = self.emit_expr(arm_body, arm_env)
+                aend = self.cur_block
+                arm_results.append((av, aend))
+                self.lines.append(f"  br label %{merge_lbl}")
+
+            self.lines.append(f"{merge_lbl}:")
+            self.cur_block = merge_lbl
+            if nk in LINEAR_CAPS:
+                return "0"
+            phi_ty = _ir_type_for_kind(nk)
+            phi_in = ", ".join(f"[ {av}, %{aend} ]" for av, aend in arm_results)
+            r = self.tmp()
+            self.lines.append(f"  {r} = phi {phi_ty} {phi_in}")
+            return r
+
         if op == "io.print_u64":
             self.uses_printf = True
+            _ = self.emit_expr(items[1], env)
             val = self.emit_expr(items[2], env)
             self.lines.append(f"  call i32 (ptr, ...) @printf(ptr nonnull @.ail_fmt_u64, i64 {val})")
             return "0"
@@ -172,15 +253,21 @@ class FunctionIREmitter:
         if op == "io.print_i64":
             self.uses_printf = True
             self.uses_fmt_i64 = True
+            _ = self.emit_expr(items[1], env)
             val = self.emit_expr(items[2], env)
             self.lines.append(f"  call i32 (ptr, ...) @printf(ptr nonnull @.ail_fmt_i64, i64 {val})")
             return "0"
 
         if op == "io.done":
-            return self.emit_expr(items[2], env)
+            self.uses_printf = True
+            _ = self.emit_expr(items[1], env)
+            ret_v = self.emit_expr(items[2], env)
+            self.lines.append("  call i32 @fflush(ptr null)")
+            return ret_v
 
         if op == "fs.write_u64":
             self.uses_fs = True
+            _ = self.emit_expr(items[1], env)
             val = self.emit_expr(items[2], env)
             self.lines.append(f"  call void @__ail_fs_write(ptr nonnull @.ail_fmt_u64, i64 {val})")
             return "0"
@@ -188,15 +275,18 @@ class FunctionIREmitter:
         if op == "fs.write_i64":
             self.uses_fs = True
             self.uses_fmt_i64 = True
+            _ = self.emit_expr(items[1], env)
             val = self.emit_expr(items[2], env)
             self.lines.append(f"  call void @__ail_fs_write(ptr nonnull @.ail_fmt_i64, i64 {val})")
             return "0"
 
         if op in ("fs.close", "net.close"):
+            _ = self.emit_expr(items[1], env)
             return "0"
 
         if op == "net.loopback_send_u64":
             self.uses_net = True
+            _ = self.emit_expr(items[1], env)
             port_v = self.emit_expr(items[2], env)
             payload_v = self.emit_expr(items[3], env)
             self.lines.append(f"  call void @__ail_net_loopback_u64(i64 {port_v}, i64 {payload_v})")
@@ -255,7 +345,9 @@ class FunctionIREmitter:
         if op == "call":
             callee = str(items[1].val)
             sig = self.sigs[callee]
-            uses_ssa_helper = sig.ret_kind.startswith("struct:") or any(pk.startswith("struct:") for pk in sig.param_kinds)
+            uses_ssa_helper = sig.ret_kind.startswith(("struct:", "enum:")) or any(
+                pk.startswith(("struct:", "enum:")) for pk in sig.param_kinds
+            )
             ir_callee = f"__ail_ssa_{callee}" if uses_ssa_helper else callee
             cc = "fastcc " if uses_ssa_helper else ""
 
@@ -265,7 +357,7 @@ class FunctionIREmitter:
                     continue  # Zero-cost linear capability erasure!
                 if pk in ("slice", "mut_slice", "atomic_u64"):
                     ir_args.append(f"ptr {env[str(arg_node.val)]}")
-                elif pk.startswith("struct:"):
+                elif pk.startswith(("struct:", "enum:")):
                     ir_args.append(f"{_ir_type_for_kind(pk)} {self.emit_expr(arg_node, env)}")
                 else:
                     ir_args.append(f"i64 {self.emit_expr(arg_node, env)}")
@@ -442,7 +534,7 @@ def emit_llvm_module(
     sigs = tenv.sigs
 
     header = [
-        "; Generated by ailang v0.2 — Z3 + Bitwuzla Verified LLVM IR (`nuw`/`nsw`, `noalias`, zero-cost `cap.*`)",
+        "; Generated by ailang v0.3 — Z3 + Bitwuzla Verified LLVM IR (`nuw`/`nsw`, `noalias`, zero-cost `cap.*`)",
         f'target triple = "{triple}"',
         "declare i64 @llvm.umin.i64(i64, i64)",
         "declare i64 @llvm.umax.i64(i64, i64)",
@@ -453,6 +545,9 @@ def emit_llvm_module(
     for sdef in tenv.structs.values():
         fields_ir = ", ".join("i64" for _ in sdef.fields)
         header.append(f"%struct.{sdef.name} = type {{ {fields_ir} }}")
+    for edef in tenv.enums.values():
+        slots = ", ".join("i64" for _ in range(1 + edef.max_fields))
+        header.append(f"%enum.{edef.name} = type {{ {slots} }}")
 
     body_blocks: list[str] = []
     exports: list[ExportedSymbol] = []
@@ -474,7 +569,7 @@ def emit_llvm_module(
 
     for form in forms:
         head = str(form.val[0].val)
-        if head in ("spec", "struct", "atomic_protocol"):
+        if head in ("spec", "struct", "enum", "atomic_protocol"):
             continue
 
         if head == "fn":
@@ -490,7 +585,9 @@ def emit_llvm_module(
             param_names: list[str] = []
             param_struct_types: list[str | None] = []
             pure_mem = True
-            has_struct_boundary = sig.ret_kind.startswith("struct:") or any(pk.startswith("struct:") for pk in sig.param_kinds)
+            has_agg_boundary = sig.ret_kind.startswith(("struct:", "enum:")) or any(
+                pk.startswith(("struct:", "enum:")) for pk in sig.param_kinds
+            )
 
             for p, pk in zip(params_n.val, sig.param_kinds):
                 pname = str(p.val[0].val)
@@ -530,6 +627,13 @@ def emit_llvm_module(
                     c_params.append((f"const {sname}*", pname))
                     py_params.append(f"ctypes.POINTER({sname})")
                     param_struct_types.append(sname)
+                elif pk.startswith("enum:"):
+                    ename = pk.split(":", 1)[1]
+                    ssa_ir_params.append(f"%enum.{ename} noundef %{pname}")
+                    c_ir_params.append(f"ptr nocapture readonly noundef %{pname}_ptr")
+                    c_params.append((f"const {ename}*", pname))
+                    py_params.append(f"ctypes.POINTER({ename})")
+                    param_struct_types.append(ename)
                 elif pk == "i64":
                     ssa_ir_params.append(f"i64 noundef %{pname}")
                     c_ir_params.append(f"i64 noundef %{pname}")
@@ -559,7 +663,7 @@ def emit_llvm_module(
 
             mem_attr = " memory(none)" if pure_mem else ""
 
-            if not has_struct_boundary:
+            if not has_agg_boundary:
                 if sig.ret_kind in LINEAR_CAPS:
                     body_blocks.append(f"define void @{name}({', '.join(ssa_ir_params)}) local_unnamed_addr nounwind{mem_attr} {{")
                     body_blocks.extend(em.lines)
@@ -584,7 +688,7 @@ def emit_llvm_module(
                 else:
                     body_blocks.append(f"  ret {ssa_ret_ir} {ret_reg}\n}}\n")
 
-                # 2. Portable C-ABI wrapper (pointer-based struct ABI safe across AAPCS64 & SysV x86_64)
+                # 2. Portable C-ABI wrapper (pointer-based struct/enum ABI safe across AAPCS64 & SysV x86_64)
                 wrap_lines: list[str] = ["entry:"]
                 call_args: list[str] = []
                 for p, pk in zip(params_n.val, sig.param_kinds):
@@ -595,20 +699,25 @@ def emit_llvm_module(
                         sname = pk.split(":", 1)[1]
                         wrap_lines.append(f"  %{pname}_val = load %struct.{sname}, ptr %{pname}_ptr, align 8")
                         call_args.append(f"%struct.{sname} %{pname}_val")
+                    elif pk.startswith("enum:"):
+                        ename = pk.split(":", 1)[1]
+                        wrap_lines.append(f"  %{pname}_val = load %enum.{ename}, ptr %{pname}_ptr, align 8")
+                        call_args.append(f"%enum.{ename} %{pname}_val")
                     elif pk in ("slice", "mut_slice", "atomic_u64"):
                         call_args.append(f"ptr %{pname}")
                     else:
                         call_args.append(f"i64 %{pname}")
 
-                if sig.ret_kind.startswith("struct:"):
+                if sig.ret_kind.startswith(("struct:", "enum:")):
                     ret_sname = sig.ret_kind.split(":", 1)[1]
+                    ret_agg_ty = _ir_type_for_kind(sig.ret_kind)
                     c_ir_params_full = [*c_ir_params, "ptr noalias nocapture writeonly noundef %_ail_out"]
                     c_params_full = [*c_params, (f"{ret_sname}*", "_out")]
                     py_params_full = [*py_params, f"ctypes.POINTER({ret_sname})"]
                     body_blocks.append(f"define void @{name}({', '.join(c_ir_params_full)}) local_unnamed_addr nounwind {{")
                     body_blocks.extend(wrap_lines)
-                    body_blocks.append(f"  %_res = call fastcc %struct.{ret_sname} @__ail_ssa_{name}({', '.join(call_args)})")
-                    body_blocks.append(f"  store %struct.{ret_sname} %_res, ptr %_ail_out, align 8")
+                    body_blocks.append(f"  %_res = call fastcc {ret_agg_ty} @__ail_ssa_{name}({', '.join(call_args)})")
+                    body_blocks.append(f"  store {ret_agg_ty} %_res, ptr %_ail_out, align 8")
                     body_blocks.append("  ret void\n}\n")
                     exports.append(
                         ExportedSymbol(
@@ -771,6 +880,7 @@ def emit_llvm_module(
         header.append('@.ail_fmt_i64 = private unnamed_addr constant [6 x i8] c"%lld\\0A\\00", align 1')
     if any_printf:
         header.append("declare noundef i32 @printf(ptr nocapture noundef readonly, ...) local_unnamed_addr nounwind")
+        header.append("declare noundef i32 @fflush(ptr nocapture noundef) local_unnamed_addr nounwind")
     if any_fs:
         header.extend(_emit_fs_runtime_ir())
     if any_net:
@@ -780,9 +890,13 @@ def emit_llvm_module(
     return "\n".join(header + body_blocks), exports, has_main
 
 
-def generate_c_header(exports: list[ExportedSymbol], structs: dict[str, StructDef] | None = None) -> str:
+def generate_c_header(
+    exports: list[ExportedSymbol],
+    structs: dict[str, StructDef] | None = None,
+    enums: dict[str, EnumDef] | None = None,
+) -> str:
     lines = [
-        "/* Auto-generated by ailang v0.2 — Formally Verified C ABI Header */",
+        "/* Auto-generated by ailang v0.3 — Formally Verified C ABI Header */",
         "#pragma once",
         "#include <stdint.h>",
         "#ifdef __cplusplus",
@@ -796,6 +910,16 @@ def generate_c_header(exports: list[ExportedSymbol], structs: dict[str, StructDe
             ct = "int64_t" if fd.kind == "i64" else "uint64_t"
             lines.append(f"    {ct} {fd.name};")
         lines.append(f"}} {sdef.name};\n")
+    for edef in (enums or {}).values():
+        lines.append("typedef enum {")
+        for vdef in edef.variants:
+            lines.append(f"    {edef.name}_{vdef.name} = {vdef.tag},")
+        lines.append(f"}} {edef.name}_Tag;\n")
+        lines.append("typedef struct {")
+        lines.append("    uint64_t tag;")
+        for p_idx in range(edef.max_fields):
+            lines.append(f"    uint64_t _p{p_idx};")
+        lines.append(f"}} {edef.name};\n")
     for ex in exports:
         p_str = ", ".join(f"{t} {n}" for t, n in ex.params_c) or "void"
         lines.append(f"{ex.ret_c} {ex.name}({p_str});")
@@ -807,9 +931,10 @@ def generate_python_bindings(
     exports: list[ExportedSymbol],
     lib_filename: str,
     structs: dict[str, StructDef] | None = None,
+    enums: dict[str, EnumDef] | None = None,
 ) -> str:
     lines = [
-        '"""Auto-generated by ailang v0.2 — Formally Verified Python ctypes Bindings."""',
+        '"""Auto-generated by ailang v0.3 — Formally Verified Python ctypes Bindings."""',
         "import ctypes",
         "from pathlib import Path",
         "",
@@ -823,6 +948,24 @@ def generate_python_bindings(
             pyt = "ctypes.c_int64" if fd.kind == "i64" else "ctypes.c_uint64"
             lines.append(f'        ("{fd.name}", {pyt}),')
         lines.append("    ]\n")
+    for edef in (enums or {}).values():
+        lines.append(f"class {edef.name}(ctypes.Structure):")
+        lines.append("    _fields_ = [")
+        lines.append('        ("tag", ctypes.c_uint64),')
+        for p_idx in range(edef.max_fields):
+            lines.append(f'        ("_p{p_idx}", ctypes.c_uint64),')
+        lines.append("    ]")
+        for vdef in edef.variants:
+            lines.append(f"    TAG_{vdef.name} = {vdef.tag}")
+        for vdef in edef.variants:
+            params_s = ", ".join(["cls", *[fd.name for fd in vdef.fields]])
+            assigns = [f"tag={vdef.tag}"] + [f"_p{i}=({fd.name} & 0xFFFFFFFFFFFFFFFF)" for i, fd in enumerate(vdef.fields)]
+            lines.append("    @classmethod")
+            lines.append(f"    def {vdef.name}({params_s}):")
+            lines.append(f"        return cls({', '.join(assigns)})")
+        lines.append("    def field(self, idx: int, signed: bool = False) -> int:")
+        lines.append('        raw = getattr(self, f"_p{idx}")')
+        lines.append("        return raw - (1 << 64) if signed and raw >= (1 << 63) else raw\n")
 
     for ex in exports:
         lines.append(f"_LIB.{ex.name}.argtypes = [{', '.join(ex.params_py)}]")
@@ -888,8 +1031,8 @@ def compile_llvm_to_native(
         subprocess.run(["clang", "-O3", "-shared", "-x", "ir", str(ll_path), "-o", str(bin_path)], check=True)
         h_path = out_dir / f"{stem}.h"
         py_path = out_dir / f"{stem}_bindings.py"
-        h_path.write_text(generate_c_header(exports, tenv.structs))
-        py_path.write_text(generate_python_bindings(exports, bin_path.name, tenv.structs))
+        h_path.write_text(generate_c_header(exports, tenv.structs, tenv.enums))
+        py_path.write_text(generate_python_bindings(exports, bin_path.name, tenv.structs, tenv.enums))
         return pb.BuildArtifacts(
             llvm_ir_path=str(ll_path),
             asm_path=str(s_path),

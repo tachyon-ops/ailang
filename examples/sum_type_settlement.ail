@@ -1,0 +1,53 @@
+; AIL v0.3 Discovery Example: Algebraic Sum Types (`enum`) + Exhaustive Pattern Matching (`match`)
+; Zero-cost tagged unions with dependent refinements & LLVM `switch` lowering!
+
+(enum SettleOutcome
+  (Filled (qty u64[1..100000]) (price u64[1..1000000]))
+  (Partial (filled u64[1..100000]) (rem u64[1..100000]) (price u64[1..1000000]))
+  (Rejected (err_code i64[-1000..-1]))
+  (Cancelled))
+
+(spec exact_notional ((o SettleOutcome))
+  (match o
+    ((Filled q p) (* q p))
+    ((Partial q rem p) (* q p))
+    ((Rejected c) 0)
+    ((Cancelled) 0)))
+
+(spec exact_audit_score ((o SettleOutcome))
+  (match o
+    ((Filled q p) (to_i64 q))
+    ((Partial q rem p) (to_i64 q))
+    ((Rejected c) c)
+    ((Cancelled) 0)))
+
+(spec exact_is_rejected ((o SettleOutcome))
+  (if (is_variant o Rejected) 1 0))
+
+(fn make_fill ((q u64[1..100000]) (p u64[1..1000000]))
+  SettleOutcome
+  (variant SettleOutcome Filled q p))
+
+(fn make_rejected ((code i64[-1000..-1]))
+  SettleOutcome
+  (variant SettleOutcome Rejected code))
+
+(fn outcome_notional ((o SettleOutcome))
+  (out u64[0..100000000000] (== out (exact_notional o)))
+  (match o
+    ((Filled q p) (* q p))
+    ((Partial q rem p) (* q p))
+    ((Rejected c) 0)
+    ((Cancelled) 0)))
+
+(fn outcome_audit_score ((o SettleOutcome))
+  (out i64[-1000..100000] (== out (exact_audit_score o)))
+  (match o
+    ((Filled q p) (to_i64 q))
+    ((Partial q rem p) (to_i64 q))
+    ((Rejected c) c)
+    ((Cancelled) 0)))
+
+(fn is_rejected_outcome ((o SettleOutcome))
+  (out u64[0..1] (== out (exact_is_rejected o)))
+  (if (is_variant o Rejected) 1 0))

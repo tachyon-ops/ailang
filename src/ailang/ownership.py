@@ -31,6 +31,31 @@ class StructDef:
 
 
 @dataclass
+class EnumVariantDef:
+    name: str
+    tag: int
+    fields: list[StructFieldDef]
+    span: Span
+
+
+@dataclass
+class EnumDef:
+    name: str
+    variants: list[EnumVariantDef]
+    span: Span
+
+    def get_variant(self, vname: str) -> EnumVariantDef | None:
+        for v in self.variants:
+            if v.name == vname:
+                return v
+        return None
+
+    @property
+    def max_fields(self) -> int:
+        return max((len(v.fields) for v in self.variants), default=0)
+
+
+@dataclass
 class FnSig:
     name: str
     kind: str  # "spec" | "fn" | "map_inplace" | "atomic_cas" | "main"
@@ -42,10 +67,17 @@ class FnSig:
 class ModuleTypeEnv:
     sigs: dict[str, FnSig] = field(default_factory=dict)
     structs: dict[str, StructDef] = field(default_factory=dict)
-    expr_types: dict[int, str] = field(default_factory=dict)  # id(SNode) -> resolved scalar/struct kind
+    enums: dict[str, EnumDef] = field(default_factory=dict)
+    expr_types: dict[int, str] = field(default_factory=dict)  # id(SNode) -> resolved scalar/struct/enum kind
 
 
-def _classify_type(tspec: SNode, structs: dict[str, StructDef], allow_math_int: bool, item_name: str) -> str:
+def _classify_type(
+    tspec: SNode,
+    structs: dict[str, StructDef],
+    allow_math_int: bool,
+    item_name: str,
+    enums: dict[str, EnumDef] | None = None,
+) -> str:
     raw = tspec.raw()
     if raw == "u64" or (isinstance(raw, list) and raw and raw[0] == "u64_range"):
         return "u64"
@@ -55,6 +87,8 @@ def _classify_type(tspec: SNode, structs: dict[str, StructDef], allow_math_int: 
         return raw
     if isinstance(raw, str) and raw in structs:
         return f"struct:{raw}"
+    if isinstance(raw, str) and enums and raw in enums:
+        return f"enum:{raw}"
     if raw == "int":
         if not allow_math_int:
             raise AILCompilerError(
@@ -80,14 +114,21 @@ def _classify_type(tspec: SNode, structs: dict[str, StructDef], allow_math_int: 
     )
 
 
-def _extract_ret_kind(ret_node: SNode, structs: dict[str, StructDef], item_name: str) -> str:
+def _extract_ret_kind(
+    ret_node: SNode,
+    structs: dict[str, StructDef],
+    item_name: str,
+    enums: dict[str, EnumDef] | None = None,
+) -> str:
     raw = ret_node.raw()
-    if isinstance(raw, str) and (raw in LINEAR_CAPS or raw in ("u64", "i64") or raw in structs):
-        return _classify_type(ret_node, structs, False, item_name)
+    if isinstance(raw, str) and (
+        raw in LINEAR_CAPS or raw in ("u64", "i64") or raw in structs or (enums and raw in enums)
+    ):
+        return _classify_type(ret_node, structs, False, item_name, enums)
     if isinstance(raw, list) and raw and raw[0] in ("u64_range", "i64_range"):
         return "u64" if raw[0] == "u64_range" else "i64"
     if isinstance(ret_node.val, list) and len(ret_node.val) >= 2:
-        return _classify_type(ret_node.val[1], structs, False, item_name)
+        return _classify_type(ret_node.val[1], structs, False, item_name, enums)
     raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, item_name, f"Invalid return spec `{pretty(ret_node)}`", ret_node.span)
 
 
@@ -233,7 +274,7 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
             )
         scope.linear_alive = s_then.linear_alive
         scope.linear_consumed = s_then.linear_consumed | s_else.linear_consumed
-        if kt.startswith("struct:") or kt in LINEAR_CAPS:
+        if kt.startswith(("struct:", "enum:")) or kt in LINEAR_CAPS or kt == "bool":
             if kt != ke:
                 raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"Branch type mismatch `{kt}` vs `{ke}`", node.span, pretty(node))
             return record(kt)
@@ -280,6 +321,133 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
         if not found:
             raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, scope.item_name, f"Struct `{sname}` has no field `{fname}`", items[2].span, pretty(node))
         return record("int" if in_spec else found[1].kind)
+
+    # Algebraic Sum Types: `(variant EnumName VariantName arg0 ...)`, `(is_variant expr VariantName)`, `(match scrut arm1 ...)`
+    if op == "variant":
+        if len(items) < 3 or not isinstance(items[1].val, str) or not isinstance(items[2].val, str):
+            raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, "Expected `(variant EnumName VariantName args...)`", node.span, pretty(node))
+        ename = items[1].val
+        vname = items[2].val
+        if ename not in tenv.enums:
+            raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, scope.item_name, f"Unknown enum `{ename}`", items[1].span, pretty(node))
+        edef = tenv.enums[ename]
+        vdef = edef.get_variant(vname)
+        if vdef is None:
+            raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, scope.item_name, f"Enum `{ename}` has no variant `{vname}`", items[2].span, pretty(node))
+        vargs = items[3:]
+        if len(vargs) != len(vdef.fields):
+            raise AILCompilerError(
+                pb.E_TYPE_MISMATCH,
+                pb.STAGE_OWNERSHIP,
+                scope.item_name,
+                f"Variant `{ename}.{vname}` expects {len(vdef.fields)} field(s), got {len(vargs)}",
+                node.span,
+                pretty(node),
+            )
+        for va, fd in zip(vargs, vdef.fields):
+            ak = _check_expr(va, scope, tenv, in_spec)
+            if not _compatible_arg(ak, fd.kind):
+                raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"Variant field `{fd.name}` expects `{fd.kind}`, got `{ak}`", va.span, pretty(node))
+        return record(f"enum:{ename}")
+
+    if op == "is_variant":
+        if len(items) != 3 or not isinstance(items[2].val, str):
+            raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, "Expected `(is_variant expr VariantName)`", node.span, pretty(node))
+        sk = _check_expr(items[1], scope, tenv, in_spec)
+        if not sk.startswith("enum:"):
+            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`is_variant` expects enum, got `{sk}`", items[1].span, pretty(node))
+        ename = sk.split(":", 1)[1]
+        vname = items[2].val
+        if tenv.enums[ename].get_variant(vname) is None:
+            raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, scope.item_name, f"Enum `{ename}` has no variant `{vname}`", items[2].span, pretty(node))
+        return record("bool")
+
+    if op == "match":
+        if len(items) < 3:
+            raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, "Expected `(match scrut arm1 ...)`", node.span, pretty(node))
+        sk = _check_expr(items[1], scope, tenv, in_spec)
+        if not sk.startswith("enum:"):
+            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`match` scrutinee must be an enum, got `{sk}`", items[1].span, pretty(node))
+        ename = sk.split(":", 1)[1]
+        edef = tenv.enums[ename]
+        seen_variants: set[str] = set()
+        has_wildcard = False
+        arm_scopes: list[LinearScope] = []
+        arm_kinds: list[str] = []
+
+        for arm in items[2:]:
+            if not isinstance(arm.val, list) or len(arm.val) != 2:
+                raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, "Each `match` arm must be `(Pattern body)`", arm.span, pretty(arm))
+            pat, arm_body = arm.val[0], arm.val[1]
+            arm_scope = scope.clone_for_branch()
+
+            if isinstance(pat.val, str) and pat.val == "_":
+                if has_wildcard or len(seen_variants) == len(edef.variants):
+                    raise AILCompilerError(pb.E_DUPLICATE_MATCH_ARM, pb.STAGE_OWNERSHIP, scope.item_name, f"Unreachable/duplicate wildcard `_` arm in match on `{ename}`", arm.span, pretty(arm))
+                has_wildcard = True
+            elif isinstance(pat.val, list) and pat.val and isinstance(pat.val[0].val, str):
+                vname = pat.val[0].val
+                vdef = edef.get_variant(vname)
+                if vdef is None:
+                    raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, scope.item_name, f"Enum `{ename}` has no variant `{vname}`", pat.val[0].span, pretty(arm))
+                if vname in seen_variants or has_wildcard:
+                    raise AILCompilerError(pb.E_DUPLICATE_MATCH_ARM, pb.STAGE_OWNERSHIP, scope.item_name, f"Duplicate/unreachable match arm for variant `{ename}.{vname}`", arm.span, pretty(arm))
+                bindings = pat.val[1:]
+                if len(bindings) != len(vdef.fields):
+                    raise AILCompilerError(
+                        pb.E_TYPE_MISMATCH,
+                        pb.STAGE_OWNERSHIP,
+                        scope.item_name,
+                        f"Match pattern `{vname}` binds {len(bindings)} variable(s), expected {len(vdef.fields)}",
+                        pat.span,
+                        pretty(pat),
+                    )
+                for bnode, fd in zip(bindings, vdef.fields):
+                    if not isinstance(bnode.val, str):
+                        raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, "Match pattern binding must be a variable name", bnode.span, pretty(pat))
+                    arm_scope.bind(bnode.val, "int" if in_spec else fd.kind, bnode.span)
+                seen_variants.add(vname)
+            else:
+                raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, f"Malformed match pattern `{pretty(pat)}`", pat.span, pretty(arm))
+
+            ak = _check_expr(arm_body, arm_scope, tenv, in_spec)
+            arm_scopes.append(arm_scope)
+            arm_kinds.append(ak)
+
+        if not has_wildcard and len(seen_variants) != len(edef.variants):
+            missing = [v.name for v in edef.variants if v.name not in seen_variants]
+            raise AILCompilerError(
+                pb.E_NON_EXHAUSTIVE_MATCH,
+                pb.STAGE_OWNERSHIP,
+                scope.item_name,
+                f"Non-exhaustive match on `{ename}`: missing variant(s) {', '.join(missing)}",
+                node.span,
+                pretty(node),
+            )
+
+        base_alive = set(arm_scopes[0].linear_alive.keys())
+        for arm_s in arm_scopes[1:]:
+            if set(arm_s.linear_alive.keys()) != base_alive:
+                raise AILCompilerError(
+                    pb.E_LINEAR_UNCONSUMED,
+                    pb.STAGE_OWNERSHIP,
+                    scope.item_name,
+                    "All arms of `match` must consume identical linear capabilities.",
+                    node.span,
+                    pretty(node),
+                )
+        scope.linear_alive = arm_scopes[0].linear_alive
+        for arm_s in arm_scopes:
+            scope.linear_consumed |= arm_s.linear_consumed
+
+        res_k = arm_kinds[0]
+        for ak in arm_kinds[1:]:
+            if res_k.startswith(("struct:", "enum:")) or res_k in LINEAR_CAPS or res_k == "bool":
+                if ak != res_k:
+                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"Match arm type mismatch `{res_k}` vs `{ak}`", node.span, pretty(node))
+            else:
+                res_k = _unify_numeric(res_k, ak, node.span, scope.item_name, pretty(node))
+        return record("u64" if res_k == "lit_pos" else res_k)
 
     # Capability-gated I/O, Filesystem (`cap.fs`), and Local Loopback Network (`cap.net`) Intrinsics
     cap_intrinsics: dict[str, tuple[str, list[str], str]] = {
@@ -444,11 +612,37 @@ def check_module_ownership_v2(forms: list[SNode]) -> ModuleTypeEnv:
             fdefs: list[StructFieldDef] = []
             for f in fields_node.val:
                 fname = str(f.val[0].val)
-                fk = _classify_type(f.val[1], tenv.structs, False, sname)
+                fk = _classify_type(f.val[1], tenv.structs, False, sname, tenv.enums)
                 if fk not in ("u64", "i64"):
-                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, sname, "Struct fields in v0.2 must be `u64` or `i64` refinements", f.span, pretty(f))
+                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, sname, "Struct fields must be `u64` or `i64` refinements", f.span, pretty(f))
                 fdefs.append(StructFieldDef(fname, fk, f.val[1]))
             tenv.structs[sname] = StructDef(sname, fdefs, form.span)
+            continue
+
+        if head == "enum":
+            if len(form.val) < 3 or not isinstance(form.val[1].val, str):
+                raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, "<enum>", "Expected `(enum EnumName (Variant1 ...) ...)`", form.span, pretty(form))
+            ename = str(form.val[1].val)
+            vdefs: list[EnumVariantDef] = []
+            seen_vnames: set[str] = set()
+            for tag_idx, vform in enumerate(form.val[2:]):
+                if not isinstance(vform.val, list) or not vform.val or not isinstance(vform.val[0].val, str):
+                    raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, ename, "Malformed enum variant declaration", vform.span, pretty(vform))
+                vname = str(vform.val[0].val)
+                if vname in seen_vnames:
+                    raise AILCompilerError(pb.E_DUPLICATE_MATCH_ARM, pb.STAGE_OWNERSHIP, ename, f"Duplicate variant `{vname}` in enum `{ename}`", vform.span, pretty(vform))
+                seen_vnames.add(vname)
+                vfdefs: list[StructFieldDef] = []
+                for fld in vform.val[1:]:
+                    if not isinstance(fld.val, list) or len(fld.val) != 2 or not isinstance(fld.val[0].val, str):
+                        raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, ename, f"Malformed field in variant `{vname}`", fld.span, pretty(fld))
+                    fname = str(fld.val[0].val)
+                    fk = _classify_type(fld.val[1], tenv.structs, False, ename, tenv.enums)
+                    if fk not in ("u64", "i64"):
+                        raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, ename, "Enum variant fields must be `u64` or `i64` refinements", fld.span, pretty(fld))
+                    vfdefs.append(StructFieldDef(fname, fk, fld.val[1]))
+                vdefs.append(EnumVariantDef(vname, tag_idx, vfdefs, vform.span))
+            tenv.enums[ename] = EnumDef(ename, vdefs, form.span)
             continue
 
         if head == "atomic_protocol":
@@ -465,11 +659,11 @@ def check_module_ownership_v2(forms: list[SNode]) -> ModuleTypeEnv:
             pkinds: list[str] = []
             for p in params_node.val:
                 pname = str(p.val[0].val)
-                pk = _classify_type(p.val[1], tenv.structs, allow_math_int=(head == "spec"), item_name=name)
+                pk = _classify_type(p.val[1], tenv.structs, allow_math_int=(head == "spec"), item_name=name, enums=tenv.enums)
                 pkinds.append(pk)
                 scope.bind(pname, pk, p.span)
 
-            rk = "int" if head == "spec" else _extract_ret_kind(ret_node, tenv.structs, name)
+            rk = "int" if head == "spec" else _extract_ret_kind(ret_node, tenv.structs, name, tenv.enums)
             tenv.sigs[name] = FnSig(name=name, kind=head, param_kinds=pkinds, ret_kind=rk)
 
             out_k = _check_expr(body_node, scope, tenv, in_spec=(head == "spec"))
@@ -487,11 +681,11 @@ def check_module_ownership_v2(forms: list[SNode]) -> ModuleTypeEnv:
             elem_k = "u64"
             for p in params_node.val:
                 pname = str(p.val[0].val)
-                pk = _classify_type(p.val[1], tenv.structs, False, name)
+                pk = _classify_type(p.val[1], tenv.structs, False, name, tenv.enums)
                 pkinds.append(pk)
                 scope.bind(pname, pk, p.span)
                 if pk == "mut_slice":
-                    elem_k = _classify_type(p.val[1].val[2], tenv.structs, False, name)
+                    elem_k = _classify_type(p.val[1].val[2], tenv.structs, False, name, tenv.enums)
             tenv.sigs[name] = FnSig(name=name, kind="map_inplace", param_kinds=pkinds, ret_kind="void")
             scope.bind(str(elem_vars.val[0].val), elem_k, elem_vars.span)
             _check_expr(body_node, scope, tenv, in_spec=False)
@@ -501,7 +695,7 @@ def check_module_ownership_v2(forms: list[SNode]) -> ModuleTypeEnv:
             proto_name = str(form.val[2].val)
             if proto_name not in protocols:
                 raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, name, f"Unknown `atomic_protocol` `{proto_name}`", form.val[2].span)
-            pkinds = [_classify_type(p.val[1], tenv.structs, False, name) for p in form.val[4].val]
+            pkinds = [_classify_type(p.val[1], tenv.structs, False, name, tenv.enums) for p in form.val[4].val]
             tenv.sigs[name] = FnSig(name=name, kind="atomic_cas", param_kinds=pkinds, ret_kind="u64")
         else:
             raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, "<module>", f"Unknown top-level declaration `{head}`", form.span, pretty(form))

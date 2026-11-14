@@ -1,0 +1,88 @@
+ail_verify_and_build_ms: 414.03300000092713
+rust_build_ms: 433.91533300018637
+c_build_ms: 123.78000000171596
+kernels {
+  kernel_name: "midpoint_u64"
+  ail_tokens: 71
+  rust_tokens: 48
+  c_tokens: 46
+  python_tokens: 45
+  ail_proto_bytes: 698
+  ail_ns_per_op: 1.4695
+  rust_ns_per_op: 1.8345
+  c_ns_per_op: 1.3795
+  python_ns_per_op: 220.78792
+}
+kernels {
+  kernel_name: "settle_fee_net"
+  ail_tokens: 127
+  rust_tokens: 112
+  c_tokens: 96
+  python_tokens: 59
+  ail_proto_bytes: 1087
+  ail_ns_per_op: 1.802
+  rust_ns_per_op: 4.1515
+  c_ns_per_op: 5.8145
+  python_ns_per_op: 273.58959
+}
+kernels {
+  kernel_name: "halve_bonus_simd"
+  ail_tokens: 87
+  rust_tokens: 85
+  c_tokens: 85
+  python_tokens: 58
+  ail_proto_bytes: 621
+  ail_ns_per_op: 181.58
+  rust_ns_per_op: 182.98
+  c_ns_per_op: 181.35
+  python_ns_per_op: 55866.4585
+}
+kernels {
+  kernel_name: "quote_net_mid"
+  ail_tokens: 91
+  rust_tokens: 117
+  c_tokens: 100
+  python_tokens: 79
+  ail_proto_bytes: 795
+  ail_ns_per_op: 0.917
+  rust_ns_per_op: 1.8185
+  c_ns_per_op: 1.8285
+  python_ns_per_op: 185.60709
+}
+kernels {
+  kernel_name: "settle_outcome_dispatch"
+  ail_tokens: 90
+  rust_tokens: 136
+  c_tokens: 93
+  python_tokens: 47
+  ail_proto_bytes: 811
+  ail_ns_per_op: 1.02
+  rust_ns_per_op: 2.082
+  c_ns_per_op: 2.274
+  python_ns_per_op: 121.78125
+}
+bug_firewall {
+  bug_name: "u64_midpoint_2pow63_overflow"
+  ail_caught_statically: true
+  ail_error_code: "E_U64_OVERFLOW"
+}
+bug_firewall {
+  bug_name: "i64_min_div_neg1_trap"
+  ail_caught_statically: true
+  ail_error_code: "E_I64_OVERFLOW"
+}
+bug_firewall {
+  bug_name: "spec_gaming_zero_mutant"
+  ail_caught_statically: true
+  ail_error_code: "E_SPEC_MUTANT_SURVIVED"
+}
+bug_firewall {
+  bug_name: "inverted_dependent_quote_struct"
+  ail_caught_statically: true
+  ail_error_code: "E_STRUCT_INVARIANT_FAILED"
+}
+bug_firewall {
+  bug_name: "non_exhaustive_enum_and_cap_leak"
+  ail_caught_statically: true
+  ail_error_code: "E_NON_EXHAUSTIVE_MATCH"
+}

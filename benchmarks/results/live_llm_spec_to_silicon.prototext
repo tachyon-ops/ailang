@@ -1,0 +1,49 @@
+provider: "antigravity-subagent"
+model_name: "blind_ail_coder (default model, zero-tool sandbox)"
+tasks_total: 6
+tasks_passed_turn1: 6
+tasks_passed_final: 6
+avg_tokens: 123.0
+total_elapsed_ms: 2455.533791995549
+results {
+  task_id: "clamped_bps_rebate"
+  passed: true
+  turns_used: 1
+  generated_tokens: 155
+  total_ms: 774.5515829956275
+}
+results {
+  task_id: "signed_sensor_step"
+  passed: true
+  turns_used: 1
+  generated_tokens: 89
+  total_ms: 281.08008300478105
+}
+results {
+  task_id: "dependent_window_span"
+  passed: true
+  turns_used: 1
+  generated_tokens: 136
+  total_ms: 282.92762499768287
+}
+results {
+  task_id: "enum_ticket_payout"
+  passed: true
+  turns_used: 1
+  generated_tokens: 158
+  total_ms: 387.7592499993625
+}
+results {
+  task_id: "folded_energy_sum"
+  passed: true
+  turns_used: 1
+  generated_tokens: 73
+  total_ms: 298.2879999981378
+}
+results {
+  task_id: "sandboxed_beacon"
+  passed: true
+  turns_used: 1
+  generated_tokens: 127
+  total_ms: 430.82329200115055
+}

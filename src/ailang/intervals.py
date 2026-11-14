@@ -70,6 +70,24 @@ def eval_interval(
         return Interval(I64_MIN, U64_MAX)
     if op == "make":
         return Interval(0, 0)
+    if op in ("variant", "is_variant"):
+        return Interval(0, 1 if op == "is_variant" else 0)
+    if op == "match":
+        scrut = raw[1]
+        arms = raw[2:]
+        arm_ivs: list[Interval] = []
+        for arm in arms:
+            pat, arm_body = arm[0], arm[1]
+            arm_env = dict(env)
+            if isinstance(pat, list) and pat:
+                vname = str(pat[0])
+                for fidx, bname in enumerate(pat[1:]):
+                    if isinstance(scrut, str) and f"{scrut}__enum__{vname}__{fidx}" in env:
+                        arm_env[str(bname)] = env[f"{scrut}__enum__{vname}__{fidx}"]
+                    elif isinstance(scrut, list) and len(scrut) >= 3 and scrut[0] == "variant" and str(scrut[2]) == vname and 3 + fidx < len(scrut):
+                        arm_env[str(bname)] = eval_interval(scrut[3 + fidx], env, fn_ret_ranges)
+            arm_ivs.append(eval_interval(arm_body, arm_env, fn_ret_ranges))
+        return Interval(min(iv.lo for iv in arm_ivs), max(iv.hi for iv in arm_ivs))
     if op == "~":
         a = eval_interval(raw[1], env, fn_ret_ranges)
         if a.lo == a.hi and a.lo >= 0:

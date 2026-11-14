@@ -117,7 +117,21 @@ def parse_source(src: str) -> list[SNode]:
         node, pos = _parse_one(tokens, pos)
         if not isinstance(node.val, list) or not node.val:
             raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, "<module>", "Top-level item must be a declaration list", node.span)
-        forms.append(node)
+        if isinstance(node.val[0].val, str) and node.val[0].val == "module":
+            if len(node.val) < 2 or not isinstance(node.val[1].val, str):
+                raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, "<module>", "Expected (module <name> <decl> ...)", node.span)
+            for sub in node.val[2:]:
+                if not isinstance(sub.val, list) or not sub.val:
+                    raise AILCompilerError(
+                        pb.E_SYNTAX,
+                        pb.STAGE_PARSE,
+                        "<module>",
+                        "Top-level item inside module must be a declaration list",
+                        sub.span,
+                    )
+                forms.append(sub)
+        else:
+            forms.append(node)
     return forms
 
 

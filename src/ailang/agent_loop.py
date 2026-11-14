@@ -213,7 +213,12 @@ def apply_deterministic_repair(forms: list[SNode], diag: pb.Diagnostic) -> tuple
                 chosen_spec = next((cn for cn in cand_names if existing_specs.get(cn) == len(pnames)), None)
                 if chosen_spec is None:
                     chosen_spec = f"spec_{target}"
-                    spec_params = _mk([_mk([_mk(pn), _mk("int")]) for pn in pnames])
+                    spec_param_nodes: list[SNode] = []
+                    for p in params_n.val:
+                        praw = p.val[1].raw()
+                        pt = _clone(p.val[1]) if (isinstance(praw, str) and (praw in tenv.structs or praw in tenv.enums)) else _mk("int")
+                        spec_param_nodes.append(_mk([_clone(p.val[0]), pt]))
+                    spec_params = _mk(spec_param_nodes)
                     synth_spec_decl = _mk([_mk("spec"), _mk(chosen_spec), spec_params, _lift_expr_to_pure_spec(body_n, tenv)])
 
                 spec_call = _mk([_mk(chosen_spec), *[_mk(pn) for pn in pnames]])
@@ -235,12 +240,16 @@ def apply_deterministic_repair(forms: list[SNode], diag: pb.Diagnostic) -> tuple
         if summary:
             return new_forms, summary
 
-    # Collect struct definitions for struct-invariant clamping if needed
+    # Collect struct & enum definitions for constructor clamping / match exhaustiveness repair
     structs_map: dict[str, list[tuple[str, SNode]]] = {}
+    enums_map: dict[str, list[tuple[str, int]]] = {}
     for f in forms:
         if str(f.val[0].val) == "struct":
             snm = str(f.val[1].val)
             structs_map[snm] = [(str(fld.val[0].val), fld.val[1]) for fld in f.val[2].val]
+        elif str(f.val[0].val) == "enum":
+            enm = str(f.val[1].val)
+            enums_map[enm] = [(str(vf.val[0].val), len(vf.val) - 1) for vf in f.val[2:]]
 
     # 2. Function / Main Body AST Repairs
     for f in forms:
@@ -367,6 +376,25 @@ def apply_deterministic_repair(forms: list[SNode], diag: pb.Diagnostic) -> tuple
                     bound_vals[fnm] = clamped
                 summary_box[0] = f"Clamped `(make {sname} ...)` field arguments to dependent struct bounds"
                 return _mk([_mk("make"), _mk(sname), *rebuilt_args], n.span)
+
+            if code == pb.E_NON_EXHAUSTIVE_MATCH and op == "match":
+                # Identify target enum from diagnostic message or arm variant names
+                target_enum = next((e for e in enums_map if f"`{e}`" in diag.message), None)
+                if target_enum:
+                    existing_arms = list(n.val[2:])
+                    seen_v = {
+                        str(arm.val[0].val[0].val)
+                        for arm in existing_arms
+                        if isinstance(arm.val, list) and arm.val and isinstance(arm.val[0].val, list) and arm.val[0].val
+                    }
+                    missing_arms: list[SNode] = []
+                    for vnm, nf in enums_map[target_enum]:
+                        if vnm not in seen_v:
+                            pat_items = [_mk(vnm), *[_mk(f"_p{i}") for i in range(nf)]]
+                            missing_arms.append(_mk([_mk(pat_items), _mk(0)]))
+                    if missing_arms:
+                        summary_box[0] = f"Added {len(missing_arms)} missing variant arm(s) to `(match ...)` on `{target_enum}`"
+                        return _mk([_clone(n.val[0]), _clone(n.val[1]), *[_clone(a) for a in existing_arms], *missing_arms], n.span)
 
             return None
 

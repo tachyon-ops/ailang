@@ -10,7 +10,7 @@ from ailang import ail_agent_pb2 as pb
 from ailang.bitwuzla_tier import BITWISE_OPS, verify_bitwise_subtree
 from ailang.diagnostics import AILCompilerError, I64_MAX, I64_MIN, Span, U64_MAX
 from ailang.intervals import Interval, eval_interval
-from ailang.ownership import LINEAR_CAPS, ModuleTypeEnv, StructDef, check_module_ownership_v2
+from ailang.ownership import EnumDef, LINEAR_CAPS, ModuleTypeEnv, StructDef, check_module_ownership_v2
 from ailang.parser import SNode, pretty
 
 Z3Value = z3.ArithRef | z3.BoolRef | dict[str, z3.ArithRef]
@@ -53,9 +53,15 @@ def _extract_range_nodes(tspec: SNode) -> tuple[SNode, SNode]:
     return SNode(0, tspec.span), SNode("MAX", tspec.span)
 
 
-def _extract_ret_spec(ret_node: SNode, structs: dict[str, StructDef] | None = None) -> tuple[str, SNode, SNode, list[SNode]]:
+def _extract_ret_spec(
+    ret_node: SNode,
+    structs: dict[str, StructDef] | None = None,
+    enums: dict[str, EnumDef] | None = None,
+) -> tuple[str, SNode, SNode, list[SNode]]:
     raw = ret_node.raw()
-    if isinstance(raw, str) and (raw in LINEAR_CAPS or raw in ("u64", "i64") or (structs and raw in structs)):
+    if isinstance(raw, str) and (
+        raw in LINEAR_CAPS or raw in ("u64", "i64") or (structs and raw in structs) or (enums and raw in enums)
+    ):
         lo_n, hi_n = _extract_range_nodes(ret_node)
         return "_ret", lo_n, hi_n, []
     if isinstance(raw, list) and raw and raw[0] in ("u64_range", "i64_range"):
@@ -78,6 +84,18 @@ def _z3_trunc_div(a: z3.ArithRef, b: z3.ArithRef) -> z3.ArithRef:
 
 def _z3_trunc_rem(a: z3.ArithRef, b: z3.ArithRef) -> z3.ArithRef:
     return a - b * _z3_trunc_div(a, b)
+
+
+def _z3_dict_eq(d1: dict[str, z3.ArithRef], d2: dict[str, z3.ArithRef]) -> z3.BoolRef:
+    if "__tag__" in d1:
+        tag1, tag2 = d1["__tag__"], d2["__tag__"]
+        eqs: list[z3.BoolRef] = [tag1 == tag2]
+        for k in d1:
+            if k != "__tag__":
+                t_idx = int(k.split(":", 1)[0])
+                eqs.append(z3.Implies(tag1 == t_idx, d1[k] == d2[k]))
+        return z3.And(*eqs)
+    return z3.And(*[d1[k] == d2[k] for k in d1])
 
 
 class ModuleVerifier:
@@ -133,6 +151,62 @@ class ModuleVerifier:
             fname = str(items[2].val)
             assert isinstance(sv, dict)
             return sv[fname]
+        if op == "variant":
+            ename = str(items[1].val)
+            vname = str(items[2].val)
+            assert self.tenv is not None and ename in self.tenv.enums
+            edef = self.tenv.enums[ename]
+            vdef = edef.get_variant(vname)
+            assert vdef is not None
+            edict: dict[str, z3.ArithRef] = {"__tag__": z3.IntVal(vdef.tag)}
+            for v in edef.variants:
+                for i in range(len(v.fields)):
+                    edict[f"{v.tag}:{v.name}.{i}"] = z3.IntVal(0)
+            for i, arg in enumerate(items[3:]):
+                av = self.eval_pure_spec(arg, z3_env)
+                assert isinstance(av, z3.ArithRef)
+                edict[f"{vdef.tag}:{vdef.name}.{i}"] = av
+            return edict
+        if op == "is_variant":
+            ename = self._node_kind(items[1]).split(":", 1)[1]
+            vname = str(items[2].val)
+            assert self.tenv is not None and ename in self.tenv.enums
+            vdef = self.tenv.enums[ename].get_variant(vname)
+            assert vdef is not None
+            sv = self.eval_pure_spec(items[1], z3_env)
+            assert isinstance(sv, dict)
+            return sv["__tag__"] == vdef.tag
+        if op == "match":
+            scrut_n = items[1]
+            sv = self.eval_pure_spec(scrut_n, z3_env)
+            assert isinstance(sv, dict)
+            tag_e = sv["__tag__"]
+            ename = self._node_kind(scrut_n).split(":", 1)[1]
+            assert self.tenv is not None and ename in self.tenv.enums
+            edef = self.tenv.enums[ename]
+            seen_tags: list[int] = []
+            arm_pairs: list[tuple[z3.BoolRef, Z3Value]] = []
+            for arm in items[2:]:
+                pat, arm_body = arm.val[0], arm.val[1]
+                arm_env = dict(z3_env)
+                if isinstance(pat.val, str) and pat.val == "_":
+                    arm_cond = z3.And(*[tag_e != t for t in seen_tags]) if seen_tags else z3.BoolVal(True)
+                else:
+                    vname = str(pat.val[0].val)
+                    vdef = edef.get_variant(vname)
+                    assert vdef is not None
+                    seen_tags.append(vdef.tag)
+                    arm_cond = tag_e == vdef.tag
+                    for i, bnode in enumerate(pat.val[1:]):
+                        arm_env[str(bnode.val)] = sv[f"{vdef.tag}:{vdef.name}.{i}"]
+                arm_pairs.append((arm_cond, self.eval_pure_spec(arm_body, arm_env)))
+            res_val = arm_pairs[-1][1]
+            for ac, av in reversed(arm_pairs[:-1]):
+                if isinstance(res_val, dict) and isinstance(av, dict):
+                    res_val = {k: z3.If(ac, av[k], res_val[k]) for k in res_val}
+                else:
+                    res_val = z3.If(ac, av, res_val)
+            return res_val
         if op in self.specs:
             sp = self.specs[op]
             senv = {pn: self.eval_pure_spec(arg, z3_env) for pn, arg in zip(sp.params, items[1:])}
@@ -165,6 +239,9 @@ class ModuleVerifier:
         if op == "max":
             return z3.If(args[0] >= args[1], args[0], args[1])
         if op in ("==", "!=", "<", "<=", ">", ">="):
+            if op in ("==", "!=") and isinstance(args[0], dict) and isinstance(args[1], dict):
+                eq_ref = _z3_dict_eq(args[0], args[1])
+                return eq_ref if op == "==" else z3.Not(eq_ref)
             return {
                 "==": lambda x, y: x == y,
                 "!=": lambda x, y: x != y,
@@ -283,6 +360,40 @@ class ModuleVerifier:
                     iv_env[f"{pname}__field__{fd.name}"] = fiv
                 z3_env[pname] = fdict
                 param_contracts.append((pname, pk, SNode(0, p.span), SNode(0, p.span)))
+            elif pk.startswith("enum:"):
+                ename = pk.split(":", 1)[1]
+                edef = self.tenv.enums[ename]
+                edict: dict[str, z3.ArithRef] = {}
+                tag_v = z3.Int(f"{pname}.__tag__")
+                assumptions.extend([tag_v >= 0, tag_v < len(edef.variants)])
+                edict["__tag__"] = tag_v
+                scalar_vars_for_ce[f"{pname}.__tag__"] = tag_v
+                for vdef in edef.variants:
+                    local_v_env = dict(z3_env)
+                    local_v_iv = dict(iv_env)
+                    for fidx, fd in enumerate(vdef.fields):
+                        fv = z3.Int(f"{pname}.{vdef.name}.{fd.name}")
+                        flo_n, fhi_n = _extract_range_nodes(fd.type_node)
+                        hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
+                        flo_v = self.eval_pure_spec(flo_n, local_v_env)
+                        fhi_v = self.eval_pure_spec(fhi_n, local_v_env)
+                        assumptions.extend(
+                            [
+                                fv >= hw_lo,
+                                fv <= hw_hi,
+                                z3.Implies(tag_v == vdef.tag, z3.And(fv >= flo_v, fv <= fhi_v)),
+                            ]
+                        )
+                        edict[f"{vdef.tag}:{vdef.name}.{fidx}"] = fv
+                        local_v_env[fd.name] = fv
+                        scalar_vars_for_ce[f"{pname}.{vdef.name}.{fd.name}"] = fv
+                        fiv_lo = eval_interval(flo_n, local_v_iv, self.fn_ret_ranges).lo
+                        fiv_hi = eval_interval(fhi_n, local_v_iv, self.fn_ret_ranges).hi
+                        fiv = Interval(max(hw_lo, fiv_lo), min(hw_hi, fiv_hi))
+                        local_v_iv[fd.name] = fiv
+                        iv_env[f"{pname}__enum__{vdef.name}__{fidx}"] = fiv
+                z3_env[pname] = edict
+                param_contracts.append((pname, pk, SNode(0, p.span), SNode(0, p.span)))
             else:
                 lo_n, hi_n = _extract_range_nodes(pspec)
                 sym = z3.Int(pname)
@@ -335,8 +446,23 @@ class ModuleVerifier:
                     bval = eval_checked(b.val[1], nz, niv, cur_extra, guard)
                     nz[bk] = bval
                     if isinstance(bval, dict):
-                        for fnm in bval:
-                            niv[f"{bk}__field__{fnm}"] = Interval(I64_MIN, U64_MAX)
+                        bk_kind = self._node_kind(b.val[1])
+                        if bk_kind.startswith("enum:"):
+                            edef = self.tenv.enums[bk_kind.split(":", 1)[1]]
+                            for vdef in edef.variants:
+                                l_iv = dict(niv)
+                                for fidx, fd in enumerate(vdef.fields):
+                                    flo_n, fhi_n = _extract_range_nodes(fd.type_node)
+                                    hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
+                                    fiv = Interval(
+                                        max(hw_lo, eval_interval(flo_n, l_iv, self.fn_ret_ranges).lo),
+                                        min(hw_hi, eval_interval(fhi_n, l_iv, self.fn_ret_ranges).hi),
+                                    )
+                                    l_iv[fd.name] = fiv
+                                    niv[f"{bk}__enum__{vdef.name}__{fidx}"] = fiv
+                        else:
+                            for fnm in bval:
+                                niv[f"{bk}__field__{fnm}"] = Interval(I64_MIN, U64_MAX)
                     else:
                         niv[bk] = eval_interval(b.val[1], niv, self.fn_ret_ranges)
                 return eval_checked(sub[2], nz, niv, cur_extra, guard)
@@ -399,6 +525,93 @@ class ModuleVerifier:
                 sv = eval_checked(sub[1], cur_z3, cur_iv, cur_extra, guard)
                 assert isinstance(sv, dict)
                 return sv[str(sub[2].val)]
+
+            if op == "variant":
+                ename = str(sub[1].val)
+                vname = str(sub[2].val)
+                edef = self.tenv.enums[ename]
+                vdef = edef.get_variant(vname)
+                assert vdef is not None
+                built_e: dict[str, z3.ArithRef] = {"__tag__": z3.IntVal(vdef.tag)}
+                for v in edef.variants:
+                    for i in range(len(v.fields)):
+                        built_e[f"{v.tag}:{v.name}.{i}"] = z3.IntVal(0)
+                fscope = dict(cur_z3)
+                for i, (fd, arg_n) in enumerate(zip(vdef.fields, sub[3:])):
+                    fv = eval_checked(arg_n, cur_z3, cur_iv, cur_extra, guard)
+                    assert isinstance(fv, z3.ArithRef)
+                    flo_n, fhi_n = _extract_range_nodes(fd.type_node)
+                    flo_v = self.eval_pure_spec(flo_n, fscope)
+                    fhi_v = self.eval_pure_spec(fhi_n, fscope)
+                    check_z3(
+                        pb.E_ENUM_INVARIANT_FAILED,
+                        arg_n.span,
+                        pretty(n),
+                        f"Enum `{ename}.{vname}` field `{fd.name}` violates dependent refinement `{pretty(fd.type_node)}`",
+                        guard,
+                        z3.And(fv >= flo_v, fv <= fhi_v),
+                        cur_z3,
+                        cur_extra,
+                    )
+                    built_e[f"{vdef.tag}:{vdef.name}.{i}"] = fv
+                    fscope[fd.name] = fv
+                return built_e
+
+            if op == "is_variant":
+                sv = eval_checked(sub[1], cur_z3, cur_iv, cur_extra, guard)
+                assert isinstance(sv, dict)
+                ename = self._node_kind(sub[1]).split(":", 1)[1]
+                vdef = self.tenv.enums[ename].get_variant(str(sub[2].val))
+                assert vdef is not None
+                return sv["__tag__"] == vdef.tag
+
+            if op == "match":
+                scrut_n = sub[1]
+                sv = eval_checked(scrut_n, cur_z3, cur_iv, cur_extra, guard)
+                assert isinstance(sv, dict)
+                tag_e = sv["__tag__"]
+                ename = self._node_kind(scrut_n).split(":", 1)[1]
+                edef = self.tenv.enums[ename]
+                seen_tags: list[int] = []
+                arm_pairs: list[tuple[z3.BoolRef, Z3Value]] = []
+                scrut_name = scrut_n.val if isinstance(scrut_n.val, str) else None
+
+                for arm in sub[2:]:
+                    pat, arm_body = arm.val[0], arm.val[1]
+                    arm_z3 = dict(cur_z3)
+                    arm_iv = dict(cur_iv)
+                    if isinstance(pat.val, str) and pat.val == "_":
+                        arm_cond = z3.And(*[tag_e != t for t in seen_tags]) if seen_tags else z3.BoolVal(True)
+                    else:
+                        vname = str(pat.val[0].val)
+                        vdef = edef.get_variant(vname)
+                        assert vdef is not None
+                        seen_tags.append(vdef.tag)
+                        arm_cond = tag_e == vdef.tag
+                        for fidx, (bnode, fd) in enumerate(zip(pat.val[1:], vdef.fields)):
+                            bname = str(bnode.val)
+                            arm_z3[bname] = sv[f"{vdef.tag}:{vdef.name}.{fidx}"]
+                            iv_key = f"{scrut_name}__enum__{vdef.name}__{fidx}" if scrut_name else ""
+                            if iv_key and iv_key in cur_iv:
+                                fiv = cur_iv[iv_key]
+                            else:
+                                flo_n, fhi_n = _extract_range_nodes(fd.type_node)
+                                hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
+                                fiv = Interval(
+                                    max(hw_lo, eval_interval(flo_n, arm_iv, self.fn_ret_ranges).lo),
+                                    min(hw_hi, eval_interval(fhi_n, arm_iv, self.fn_ret_ranges).hi),
+                                )
+                            arm_iv[bname] = fiv
+                    arm_val = eval_checked(arm_body, arm_z3, arm_iv, cur_extra, z3.And(guard, arm_cond))
+                    arm_pairs.append((arm_cond, arm_val))
+
+                res_val = arm_pairs[-1][1]
+                for ac, av in reversed(arm_pairs[:-1]):
+                    if isinstance(res_val, dict) and isinstance(av, dict):
+                        res_val = {k: z3.If(ac, av[k], res_val[k]) for k in res_val}
+                    else:
+                        res_val = z3.If(ac, av, res_val)
+                return res_val
 
             if op in ("io.print_u64", "io.print_i64", "fs.write_u64", "fs.write_i64"):
                 _ = eval_checked(sub[2], cur_z3, cur_iv, cur_extra, guard)
@@ -529,7 +742,7 @@ class ModuleVerifier:
                         continue
                     av = eval_checked(arg_node, cur_z3, cur_iv, cur_extra, guard)
                     callee_env[pname] = av
-                    if not pkind.startswith("struct:"):
+                    if not pkind.startswith(("struct:", "enum:")):
                         assert isinstance(av, z3.ArithRef)
                         plo_v = self.eval_pure_spec(plo_n, callee_env)
                         phi_v = self.eval_pure_spec(phi_n, callee_env)
@@ -559,6 +772,35 @@ class ModuleVerifier:
                     for ens in fc.ensures:
                         axioms.append(self.eval_pure_spec(ens, callee_env))
                     return rdict
+                if fc.ret_kind.startswith("enum:"):
+                    ename = fc.ret_kind.split(":", 1)[1]
+                    edef = self.tenv.enums[ename]
+                    erdict: dict[str, z3.ArithRef] = {}
+                    tag_r = self.fresh_int(f"_{callee}_tag")
+                    axioms.extend([tag_r >= 0, tag_r < len(edef.variants)])
+                    erdict["__tag__"] = tag_r
+                    for vdef in edef.variants:
+                        fscope = dict(callee_env)
+                        for fidx, fd in enumerate(vdef.fields):
+                            fv = self.fresh_int(f"_{callee}_{vdef.name}_{fd.name}")
+                            flo_n, fhi_n = _extract_range_nodes(fd.type_node)
+                            hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
+                            axioms.extend(
+                                [
+                                    fv >= hw_lo,
+                                    fv <= hw_hi,
+                                    z3.Implies(
+                                        tag_r == vdef.tag,
+                                        z3.And(fv >= self.eval_pure_spec(flo_n, fscope), fv <= self.eval_pure_spec(fhi_n, fscope)),
+                                    ),
+                                ]
+                            )
+                            erdict[f"{vdef.tag}:{vdef.name}.{fidx}"] = fv
+                            fscope[fd.name] = fv
+                    callee_env[fc.ret_name] = erdict
+                    for ens in fc.ensures:
+                        axioms.append(self.eval_pure_spec(ens, callee_env))
+                    return erdict
 
                 call_ret = self.fresh_int(f"_{callee}_ret")
                 callee_env[fc.ret_name] = call_ret
@@ -672,6 +914,9 @@ class ModuleVerifier:
             if op == "max":
                 return z3.If(args[0] >= args[1], args[0], args[1])
             if op in ("==", "!=", "<", "<=", ">", ">="):
+                if op in ("==", "!=") and isinstance(args[0], dict) and isinstance(args[1], dict):
+                    eq_ref = _z3_dict_eq(args[0], args[1])
+                    return eq_ref if op == "==" else z3.Not(eq_ref)
                 return {
                     "==": lambda x, y: x == y,
                     "!=": lambda x, y: x != y,
@@ -689,10 +934,10 @@ class ModuleVerifier:
             raise NotImplementedError(op)
 
         out_val = eval_checked(body_node, z3_env, iv_env, [], z3.BoolVal(True))
-        rname, rlo_n, rhi_n, ensures_list = _extract_ret_spec(ret_node, self.tenv.structs)
+        rname, rlo_n, rhi_n, ensures_list = _extract_ret_spec(ret_node, self.tenv.structs, self.tenv.enums)
         if sig.ret_kind not in LINEAR_CAPS:
             renv = dict(z3_env, **{rname: out_val})
-            if not sig.ret_kind.startswith("struct:"):
+            if not sig.ret_kind.startswith(("struct:", "enum:")):
                 assert isinstance(out_val, z3.ArithRef)
                 rlo_v = self.eval_pure_spec(rlo_n, renv)
                 rhi_v = self.eval_pure_spec(rhi_n, renv)
@@ -720,7 +965,7 @@ class ModuleVerifier:
 
         if not is_main:
             self.fn_contracts[name] = FnContractInfo(name, param_contracts, rname, sig.ret_kind, rlo_n, rhi_n, ensures_list)
-            if not sig.ret_kind.startswith("struct:"):
+            if not sig.ret_kind.startswith(("struct:", "enum:")):
                 self.fn_ret_ranges[name] = ([p[0] for p in param_contracts], rlo_n.raw(), rhi_n.raw())
 
         stats.verified = True
@@ -749,8 +994,8 @@ class ModuleVerifier:
             [SNode("fn", form.span), SNode(name, items[1].span), SNode(synth_params, params_node.span), ret_node, body_node],
             form.span,
         )
-        # Re-run ownership on synth_fn alongside existing structs/specs so expr_types has scalar type tags
-        sub_tenv = check_module_ownership_v2([f for f in getattr(self, "_all_forms", []) if str(f.val[0].val) in ("struct", "spec")] + [synth_fn])
+        # Re-run ownership on synth_fn alongside existing structs/enums/specs so expr_types has scalar type tags
+        sub_tenv = check_module_ownership_v2([f for f in getattr(self, "_all_forms", []) if str(f.val[0].val) in ("struct", "enum", "spec")] + [synth_fn])
         old_tenv = self.tenv
         assert old_tenv is not None
         sub_tenv.sigs.update({k: v for k, v in old_tenv.sigs.items() if k != name})
@@ -843,7 +1088,7 @@ class ModuleVerifier:
         out: list[pb.FunctionProofStats] = []
         for form in forms:
             head = str(form.val[0].val)
-            if head == "struct":
+            if head in ("struct", "enum"):
                 continue
             if head == "spec":
                 sname = str(form.val[1].val)

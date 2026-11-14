@@ -43,6 +43,9 @@ enum ErrorCode {
   E_SPEC_AMBIGUITY = 20;
   E_I64_OVERFLOW = 21;
   E_STRUCT_INVARIANT_FAILED = 22;
+  E_NON_EXHAUSTIVE_MATCH = 23;
+  E_DUPLICATE_MATCH_ARM = 24;
+  E_ENUM_INVARIANT_FAILED = 25;
 }
 
 enum Status {
@@ -179,4 +182,58 @@ message RepairSession {
   ModuleProto repaired_ast = 5;
   repeated RepairStep steps = 6;
   BuildArtifacts artifacts = 7;
+}
+
+// ============================================================================
+// 4. Language & Live LLM Benchmarks (`ail bench-langs`, `ail bench-llm`)
+// ============================================================================
+
+message LanguageBenchmarkRow {
+  string kernel_name = 1;
+  uint32 ail_tokens = 2;
+  uint32 rust_tokens = 3;
+  uint32 c_tokens = 4;
+  uint32 python_tokens = 5;
+  uint32 ail_proto_bytes = 6;
+  double ail_ns_per_op = 7;
+  double rust_ns_per_op = 8;
+  double c_ns_per_op = 9;
+  double python_ns_per_op = 10;
+}
+
+message BugFirewallRow {
+  string bug_name = 1;
+  bool ail_caught_statically = 2;
+  bool rust_caught_statically = 3;
+  bool c_caught_statically = 4;
+  bool python_caught_statically = 5;
+  string ail_error_code = 6;
+}
+
+message LanguageBenchmarkReport {
+  double ail_verify_and_build_ms = 1;
+  double rust_build_ms = 2;
+  double c_build_ms = 3;
+  repeated LanguageBenchmarkRow kernels = 4;
+  repeated BugFirewallRow bug_firewall = 5;
+}
+
+message LLMBenchTaskResult {
+  string task_id = 1;
+  bool passed = 2;
+  uint32 turns_used = 3;
+  uint32 generated_tokens = 4;
+  double total_ms = 5;
+  repeated ErrorCode triggered_errors = 6;
+}
+
+message LLMBenchReport {
+  string provider = 1;
+  string model_name = 2;
+  uint32 tasks_total = 3;
+  uint32 tasks_passed_turn1 = 4;
+  uint32 tasks_passed_final = 5;
+  double avg_tokens = 6;
+  double total_elapsed_ms = 7;
+  repeated LLMBenchTaskResult results = 8;
 }

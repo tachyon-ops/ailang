@@ -40,6 +40,8 @@ def audit_module_specifications(
             mv.specs[sname] = SpecDeclInfo(sname, pnames, form.val[3])
             continue
 
+        if head in ("struct", "enum"):
+            continue
         if head != "fn":
             continue
 
@@ -47,8 +49,8 @@ def audit_module_specifications(
         sig = tenv.sigs[fn_name]
         params_node, ret_node, body_node = form.val[2], form.val[3], form.val[4]
 
-        # Audit pure scalar functions (`u64` / `i64` return, scalar/struct inputs without slices or linear caps)
-        if sig.ret_kind in LINEAR_CAPS or sig.ret_kind.startswith("struct:"):
+        # Audit pure scalar functions (`u64` / `i64` return, scalar/struct/enum inputs without slices or linear caps)
+        if sig.ret_kind in LINEAR_CAPS or sig.ret_kind.startswith(("struct:", "enum:")):
             continue
         if any(pk in ("slice", "mut_slice", "atomic_u64") or pk in LINEAR_CAPS for pk in sig.param_kinds):
             continue
@@ -75,6 +77,31 @@ def audit_module_specifications(
                     fscope[fd.name] = fv
                     scalar_vars[f"{pname}.{fd.name}"] = fv
                 env[pname] = fdict
+            elif pk.startswith("enum:"):
+                ename = pk.split(":", 1)[1]
+                edef = tenv.enums[ename]
+                edict: dict[str, z3.ArithRef] = {}
+                tag_v = z3.Int(f"{pname}.__tag__")
+                pre.extend([tag_v >= 0, tag_v < len(edef.variants)])
+                edict["__tag__"] = tag_v
+                scalar_vars[f"{pname}.__tag__"] = tag_v
+                for vdef in edef.variants:
+                    vscope = dict(env)
+                    for fidx, fd in enumerate(vdef.fields):
+                        fv = z3.Int(f"{pname}.{vdef.name}.{fd.name}")
+                        flo_n, fhi_n = _extract_range_nodes(fd.type_node)
+                        hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
+                        pre.extend(
+                            [
+                                fv >= hw_lo,
+                                fv <= hw_hi,
+                                z3.Implies(tag_v == vdef.tag, z3.And(fv >= mv.eval_pure_spec(flo_n, vscope), fv <= mv.eval_pure_spec(fhi_n, vscope))),
+                            ]
+                        )
+                        edict[f"{vdef.tag}:{vdef.name}.{fidx}"] = fv
+                        vscope[fd.name] = fv
+                        scalar_vars[f"{pname}.{vdef.name}.{fd.name}"] = fv
+                env[pname] = edict
             else:
                 lo_n, hi_n = _extract_range_nodes(p.val[1])
                 v = z3.Int(pname)
@@ -119,7 +146,7 @@ def audit_module_specifications(
             ref_out = z3.Int("_verified_ref_out")
             ref_extra = []
 
-        rname, rlo_n, rhi_n, ensures_list = _extract_ret_spec(ret_node, tenv.structs)
+        rname, rlo_n, rhi_n, ensures_list = _extract_ret_spec(ret_node, tenv.structs, tenv.enums)
         ret_hw_lo, ret_hw_hi = (I64_MIN, I64_MAX) if sig.ret_kind == "i64" else (0, U64_MAX)
 
         def spec_holds_for(cand: z3.ArithRef) -> z3.BoolRef:
