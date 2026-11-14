@@ -1,4 +1,4 @@
-"""Unified `ail` v0.2 CLI: Protobuf (`--proto` / `--prototext`), `check`, `audit-spec`, `diff-specs`, `build`, `run`, `repair`."""
+"""Unified `ail` v1.0 CLI: Protobuf (`--proto` / `--prototext`), `check`, `audit-spec`, `diff-specs`, `build`, `run`, `repair`, `studio`, `mcp`, `stdlib`."""
 
 from __future__ import annotations
 import argparse
@@ -8,10 +8,7 @@ import sys
 import time
 
 from ailang import ail_agent_pb2 as pb
-from ailang.agent_loop import run_repair_session
-from ailang.codegen_llvm import compile_llvm_to_native
-from ailang.lang_bench import format_language_benchmark_markdown, run_language_benchmark
-from ailang.llm_bench import run_llm_benchmark
+from ailang.agent_loop import format_module_source, run_repair_session
 from ailang.diagnostics import (
     AILCompilerError,
     format_human_summary,
@@ -19,10 +16,18 @@ from ailang.diagnostics import (
     to_proto_bytes,
     to_prototext,
 )
+from ailang.lang_bench import format_language_benchmark_markdown, run_language_benchmark
+from ailang.llm_bench import run_llm_benchmark
+from ailang.modules import list_stdlib_modules, load_ail_module_with_imports
+from ailang.multi_target import SUPPORTED_TARGETS, build_multi_target
 from ailang.ownership import ModuleTypeEnv, check_module_ownership_v2
-from ailang.parser import SNode, load_ail_path, module_to_proto, parse_source
+from ailang.parser import SNode, module_to_proto, parse_source, pretty
 from ailang.spec_firewall import audit_module_specifications, diff_candidate_modules
 from ailang.verifier import ModuleVerifier
+
+
+def _module_stem(path: Path) -> str:
+    return path.name.removesuffix(".ail.pb").removesuffix(".ail").removesuffix(".pb")
 
 
 def _emit_response(resp: pb.CompilerResponse, fmt: str, proto_out: str | None = None) -> int:
@@ -70,7 +75,7 @@ def check_and_verify_path(path: Path) -> tuple[pb.CompilerResponse, list[SNode],
     t0 = time.perf_counter()
     resp = pb.CompilerResponse()
     try:
-        forms = load_ail_path(path)
+        forms = load_ail_module_with_imports(path)
         tenv = check_module_ownership_v2(forms)
         mv = ModuleVerifier(tenv)
         stats = mv.verify_module(forms)
@@ -85,10 +90,47 @@ def check_and_verify_path(path: Path) -> tuple[pb.CompilerResponse, list[SNode],
         return resp, [], ModuleTypeEnv()
 
 
+def _format_stdlib_catalog(module_filter: str | None = None) -> str:
+    paths = list_stdlib_modules()
+    if module_filter:
+        filt = module_filter.strip().removesuffix(".ail").removeprefix("stdlib/")
+        paths = [p for p in paths if p.stem == filt]
+    if not paths:
+        return "[STDLIB] No matching built-in stdlib modules found."
+
+    lines = [f"[AIL STDLIB] {len(paths)} verified module(s):"]
+    for mod_path in paths:
+        forms = parse_source(mod_path.read_text(encoding="utf-8"))
+        lines.append(f"\n  Module `stdlib/{mod_path.stem}` ({mod_path}):")
+        for form in forms:
+            if not isinstance(form.val, list) or not form.val:
+                continue
+            head = str(form.val[0].val)
+            if head == "const" and len(form.val) >= 4:
+                lines.append(f"    const  {pretty(form.val[1])}: {pretty(form.val[2])} = {pretty(form.val[3])}")
+            elif head == "struct" and len(form.val) >= 3:
+                flds = ", ".join(
+                    f"{pretty(f.val[0])}: {pretty(f.val[1])}"
+                    for f in form.val[2].val
+                    if isinstance(f.val, list) and len(f.val) >= 2
+                )
+                lines.append(f"    struct {pretty(form.val[1])} {{ {flds} }}")
+            elif head == "enum" and len(form.val) >= 3:
+                vnames = [pretty(v.val[0]) for v in form.val[2:] if isinstance(v.val, list) and v.val]
+                lines.append(f"    enum   {pretty(form.val[1])} ({' | '.join(vnames)})")
+            elif head == "spec" and len(form.val) >= 4:
+                params = " ".join(pretty(p) for p in form.val[2].val)
+                lines.append(f"    spec   ({pretty(form.val[1])} ({params}))")
+            elif head in ("fn", "map_inplace") and len(form.val) >= 4:
+                params = " ".join(pretty(p) for p in form.val[2].val)
+                lines.append(f"    {head:<6} ({pretty(form.val[1])} ({params})) -> {pretty(form.val[3])}")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ail",
-        description="AIL v0.2: Protobuf-Native Formally Verified AI Agent Programming Language Toolchain",
+        description="AIL v1.0: Protobuf-Native Formally Verified AI Agent Language & Multi-Target Compiler Toolchain",
     )
     parser.add_argument(
         "--format",
@@ -114,9 +156,18 @@ def main(argv: list[str] | None = None) -> int:
     p_diff.add_argument("spec_a", type=Path, help="Candidate A `.ail` or `.ail.pb`")
     p_diff.add_argument("spec_b", type=Path, help="Candidate B `.ail` or `.ail.pb`")
 
-    p_build = sub.add_parser("build", help="Verify module (and optionally audit specs) then compile via LLVM -O3 to native silicon")
+    p_build = sub.add_parser(
+        "build",
+        help="Verify module (and optionally audit specs) then compile to native LLVM, WebAssembly, C11, Rust, or all targets",
+    )
     p_build.add_argument("input", type=Path, help="Input `.ail` or `.ail.pb` module")
-    p_build.add_argument("-o", "--out-dir", type=Path, default=Path("build"), help="Output directory for native artifacts")
+    p_build.add_argument("-o", "--out-dir", type=Path, default=Path("build"), help="Output directory for compiled artifacts")
+    p_build.add_argument(
+        "--target",
+        choices=list(SUPPORTED_TARGETS),
+        default="native",
+        help="Compilation target (`native`, `wasm`, `c`, `rust`, or `all`; default: `native`)",
+    )
     p_build.add_argument("--lib", action="store_true", help="Force shared library `.dylib`/`.so` + C/Python FFI generation")
     p_build.add_argument("--require-tight-specs", action="store_true", help="Reject build if any scalar `fn` fails spec mutation tightness")
 
@@ -136,6 +187,21 @@ def main(argv: list[str] | None = None) -> int:
     p_rep.add_argument("--max-iters", type=int, default=8, help="Maximum repair loop turns (default: 8)")
     p_rep.add_argument("--backend", choices=["deterministic", "gemini"], default="deterministic", help="Repair backend")
     p_rep.add_argument("--no-tight-specs", action="store_true", help="Skip SpecMut tightness enforcement during repair")
+
+    p_studio = sub.add_parser("studio", help="Launch AIL Web Studio playground or regenerate static `web/demos.json`")
+    p_studio.add_argument("--host", default="127.0.0.1", help="Bind host address (default: 127.0.0.1)")
+    p_studio.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
+    p_studio.add_argument(
+        "--regenerate-demos",
+        action="store_true",
+        help="Regenerate static `web/demos.json` bundle from v1.0 backends and exit",
+    )
+    p_studio.add_argument("--out", type=Path, default=None, help="Optional output path for `--regenerate-demos`")
+
+    sub.add_parser("mcp", help="Launch the AIL Model Context Protocol (MCP) JSON-RPC 2.0 stdio server")
+
+    p_stdlib = sub.add_parser("stdlib", help="List built-in verified `stdlib/*.ail` modules and exported functions/specs")
+    p_stdlib.add_argument("--module", default=None, help="Optional stdlib module filter (e.g. `math`, `finance`, `bits`, `parse`)")
 
     p_bl = sub.add_parser("bench-langs", help="Run empirical benchmark comparing AIL vs Rust vs C vs Python")
     p_bl.add_argument("-o", "--out-dir", type=Path, default=Path("build/bench_langs"), help="Working build directory")
@@ -182,8 +248,8 @@ def main(argv: list[str] | None = None) -> int:
         t0 = time.perf_counter()
         resp = pb.CompilerResponse()
         try:
-            fa = load_ail_path(args.spec_a)
-            fb = load_ail_path(args.spec_b)
+            fa = load_ail_module_with_imports(args.spec_a)
+            fb = load_ail_module_with_imports(args.spec_b)
             diffs, diags = diff_candidate_modules(fa, fb)
             resp.spec_diffs.extend(diffs)
             resp.diagnostics.extend(diags)
@@ -209,24 +275,66 @@ def main(argv: list[str] | None = None) -> int:
                 resp.total_elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 return _emit_response(resp, args.format, args.proto_out)
 
-        stem = args.input.name.removesuffix(".ail.pb").removesuffix(".ail").removesuffix(".pb")
+        stem = _module_stem(args.input)
+        target = getattr(args, "target", "native") if args.cmd == "build" else "native"
         force_lib = True if getattr(args, "lib", False) else (False if args.cmd == "run" else None)
-        artifacts = compile_llvm_to_native(forms, tenv, args.out_dir, stem, build_shared_lib=force_lib)
-        resp.artifacts.CopyFrom(artifacts)
+
+        try:
+            report = build_multi_target(
+                forms,
+                tenv,
+                args.out_dir,
+                stem,
+                target=target,
+                build_shared_lib=force_lib,
+            )
+        except AILCompilerError as err:
+            resp.status = pb.STATUS_REJECTED
+            resp.diagnostics.append(err.diag)
+            resp.total_elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return _emit_response(resp, args.format, args.proto_out)
+
+        if report.native is not None:
+            resp.artifacts.CopyFrom(report.native)
         resp.total_elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         if args.cmd == "build":
-            return _emit_response(resp, args.format, args.proto_out)
+            rc = _emit_response(resp, args.format, args.proto_out)
+            if args.format == "human" and target != "native":
+                print(report.format_human())
+            return rc
 
         if args.format in ("proto", "prototext") or args.proto_out:
             _emit_response(resp, args.format, args.proto_out)
-        proc = subprocess.run([artifacts.binary_or_lib_path], check=False)
+        assert report.native is not None
+        proc = subprocess.run([report.native.binary_or_lib_path], check=False)
         return proc.returncode
 
     if args.cmd == "repair":
+        stem = _module_stem(args.input)
+        try:
+            forms = load_ail_module_with_imports(args.input)
+        except AILCompilerError as err:
+            resp = pb.CompilerResponse(status=pb.STATUS_REJECTED, diagnostics=[err.diag])
+            sess = pb.RepairSession(
+                final_status=pb.STATUS_REJECTED,
+                iterations=0,
+                steps=[
+                    pb.RepairStep(
+                        turn=1,
+                        triggered_code=err.diag.code,
+                        target_item=err.diag.item_name,
+                        patch_summary=f"Load failed: {err.diag.message}",
+                        check_response=resp,
+                    )
+                ],
+            )
+            return _emit_repair_session(sess, args.format, args.proto_out)
+
         sess = run_repair_session(
-            args.input,
+            format_module_source(forms),
             out_dir=args.out_dir,
+            stem=stem,
             max_iters=args.max_iters,
             require_tight_specs=(not args.no_tight_specs),
             backend=args.backend,
@@ -238,6 +346,35 @@ def main(argv: list[str] | None = None) -> int:
             args.write_ast.parent.mkdir(parents=True, exist_ok=True)
             args.write_ast.write_bytes(sess.repaired_ast.SerializeToString())
         return _emit_repair_session(sess, args.format, args.proto_out)
+
+    if args.cmd == "studio":
+        from ailang.web_server import DEFAULT_WEB_DIR, generate_static_demos, serve_studio
+
+        if args.regenerate_demos:
+            target_path = args.out or (DEFAULT_WEB_DIR / "demos.json")
+            payload = generate_static_demos(out_path=target_path)
+            if args.format == "human":
+                print(
+                    f"[REGENERATED] {target_path} ({len(payload.get('presets', []))} presets, "
+                    f"targets={','.join(payload.get('targets', []))})"
+                )
+            elif args.format in ("proto", "prototext") or args.proto_out:
+                _emit_response(pb.CompilerResponse(status=pb.STATUS_VERIFIED), args.format, args.proto_out)
+            return 0
+        serve_studio(host=args.host, port=args.port)
+        return 0
+
+    if args.cmd == "mcp":
+        from ailang.mcp_server import main as mcp_main
+
+        return mcp_main()
+
+    if args.cmd == "stdlib":
+        summary = _format_stdlib_catalog(args.module)
+        if args.format in ("proto", "prototext") or args.proto_out:
+            return _emit_response(pb.CompilerResponse(status=pb.STATUS_VERIFIED), args.format, args.proto_out)
+        print(summary)
+        return 0
 
     if args.cmd == "bench-langs":
         report, md = run_language_benchmark(

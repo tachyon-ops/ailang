@@ -1,0 +1,21 @@
+; Verified 64-bit bit-packing and bit-masking primitives for ailang stdlib (`stdlib/bits`).
+
+(fn low_byte ((x u64[0..MAX]))
+  (out u64[0..255] (<= out 255))
+  (& x 255))
+
+(fn pack_u32_pair ((hi u64[0..4294967295]) (lo u64[0..4294967295]))
+  (out u64[0..MAX] (>= out lo))
+  (| (<< hi 32) lo))
+
+(fn unpack_hi32 ((packed u64[0..MAX]))
+  (out u64[0..4294967295] (== out (>> packed 32)))
+  (>> packed 32))
+
+(fn unpack_lo32 ((packed u64[0..MAX]))
+  (out u64[0..4294967295] (<= out 4294967295))
+  (& packed 4294967295))
+
+(fn mask_bits_u64 ((x u64[0..MAX]) (width u64[0..63]))
+  (out u64[0..MAX] (<= out x))
+  (& x (- (<< 1 width) 1)))

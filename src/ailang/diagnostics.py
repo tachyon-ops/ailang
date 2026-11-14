@@ -37,6 +37,8 @@ REPAIR_HINTS: dict[int, str] = {
     pb.E_NON_EXHAUSTIVE_MATCH: "Add match arms covering every variant of the enum (or add a trailing wildcard `(_ ...)` arm).",
     pb.E_DUPLICATE_MATCH_ARM: "Remove duplicate variant names in `(enum ...)` or duplicate match pattern arms.",
     pb.E_ENUM_INVARIANT_FAILED: "Field values passed to `(variant EnumName VariantName ...)` violate the variant's dependent field refinement bounds.",
+    pb.E_IMPORT_CYCLE: "Break circular `(import ...)` dependencies between modules into a shared base module.",
+    pb.E_OUT_OF_BOUNDS: "Ensure byte offset `idx` and read width (1, 2, 4, or 8 bytes) satisfy `0 <= idx` and `idx + width <= len_var`.",
 }
 
 

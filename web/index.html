@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>AIL v1.0 Web Studio — Formally Verified Compiler &amp; WASM Sandbox</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="studio-header">
+    <div class="header-brand">
+      <svg class="brand-logo" viewBox="0 0 128 128" width="36" height="36" aria-hidden="true">
+        <rect x="12" y="12" width="104" height="104" rx="22" fill="none" stroke="currentColor" stroke-width="8"/>
+        <path d="M38 90 L64 34 L90 90 M48 70 H80" fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <h1>AIL v1.0 Web Studio</h1>
+        <p class="header-subtitle">Protobuf AST · Z3 &amp; Bitwuzla Proofs · SpecMut Firewall · LLVM / WASM / C11 / Rust</p>
+      </div>
+    </div>
+
+    <div class="header-controls">
+      <span id="mode-badge" class="status-pill status-neutral">Initializing…</span>
+      <span id="verify-badge" class="status-pill status-neutral" aria-live="polite">Ready</span>
+      <div class="theme-control">
+        <label for="theme-select">Theme</label>
+        <select id="theme-select" aria-label="Color scheme preference">
+          <option value="system">System</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </div>
+    </div>
+  </header>
+
+  <main class="studio-main">
+    <section class="toolbar card" aria-label="Presets and compiler actions">
+      <div class="preset-strip" id="preset-strip" role="group" aria-label="Curated AIL programs">
+        <button type="button" class="preset-btn is-active" data-preset="signed_quote">Signed Quote</button>
+        <button type="button" class="preset-btn" data-preset="sum_type_settlement">Sum Type Settlement</button>
+        <button type="button" class="preset-btn" data-preset="defi_waterfall">DeFi Fee Waterfall</button>
+        <button type="button" class="preset-btn" data-preset="wire_frame_parser">Wire Frame Parser</button>
+        <button type="button" class="preset-btn" data-preset="simd_halving">SIMD Halving</button>
+        <button type="button" class="preset-btn preset-broken" data-preset="broken_agent_draft">Broken Agent Draft</button>
+      </div>
+
+      <div class="action-bar">
+        <label class="checkbox-label">
+          <input type="checkbox" id="tight-specs-toggle" checked>
+          <span>Require Tight Specs (<code>SpecMut</code>)</span>
+        </label>
+        <div class="action-buttons">
+          <button type="button" id="btn-compile" class="btn btn-primary">Verify &amp; Compile</button>
+          <button type="button" id="btn-repair" class="btn btn-secondary">Autonomous Repair</button>
+          <button type="button" id="btn-download-wasm" class="btn btn-ghost" disabled>Download .wasm</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="workbench" aria-label="AIL Editor and Multi-Target Inspector">
+      <div class="editor-column card">
+        <div class="column-header">
+          <div>
+            <h2 id="preset-title">Signed Quote</h2>
+            <p id="preset-subtitle" class="muted">Dependent struct bounds (ask &gt;= bid) + signed i64 PnL refinements</p>
+          </div>
+          <div id="preset-tags" class="tag-row"></div>
+        </div>
+
+        <label class="sr-only" for="source-editor">AIL module source editor</label>
+        <textarea id="source-editor" class="source-editor" spellcheck="false" rows="20" aria-label="AIL S-expression module source"></textarea>
+
+        <div id="diagnostic-banner" class="diagnostic-banner" hidden aria-live="polite">
+          <div class="diag-header">
+            <strong id="diag-code">STATUS_REJECTED</strong>
+            <span id="diag-location" class="mono"></span>
+          </div>
+          <p id="diag-message"></p>
+          <pre id="diag-counterexample" class="code-snippet" hidden></pre>
+          <p id="diag-hint" class="diag-hint"></p>
+          <button type="button" id="btn-inline-repair" class="btn btn-secondary">Run Closed-Loop Repair</button>
+        </div>
+
+        <div id="repair-timeline" class="repair-timeline" hidden aria-live="polite">
+          <div class="repair-header">
+            <h3>Closed-Loop Repair Timeline</h3>
+            <span id="repair-summary" class="mono"></span>
+          </div>
+          <ol id="repair-steps" class="repair-steps"></ol>
+        </div>
+      </div>
+
+      <div class="inspector-column">
+        <div class="tabs-shell">
+          <div focusgroup="tablist nomemory" role="tablist" aria-label="Verification telemetry and generated targets" class="tablist">
+            <button type="button" role="tab" id="tab-proofs" aria-selected="true" focusgroupstart>Proofs &amp; SpecMut</button>
+            <button type="button" role="tab" id="tab-wasm" aria-selected="false">WASM Sandbox</button>
+            <button type="button" role="tab" id="tab-c" aria-selected="false">C11</button>
+            <button type="button" role="tab" id="tab-rust" aria-selected="false">Rust no_std</button>
+            <button type="button" role="tab" id="tab-llvm" aria-selected="false">LLVM IR</button>
+            <button type="button" role="tab" id="tab-proto" aria-selected="false">Protobuf</button>
+          </div>
+
+          <div class="tab-panels">
+            <div role="tabpanel" id="panel-proofs" aria-labelledby="tab-proofs" tabindex="0">
+              <div class="panel-inner">
+                <div class="telemetry-kpis" id="telemetry-kpis">
+                  <div class="kpi-box">
+                    <span class="kpi-label">Pipeline Time</span>
+                    <strong id="kpi-elapsed" class="kpi-value">—</strong>
+                  </div>
+                  <div class="kpi-box">
+                    <span class="kpi-label">Functions Proved</span>
+                    <strong id="kpi-proved" class="kpi-value">—</strong>
+                  </div>
+                  <div class="kpi-box">
+                    <span class="kpi-label">SpecMut Killed</span>
+                    <strong id="kpi-mutants" class="kpi-value">—</strong>
+                  </div>
+                  <div class="kpi-box">
+                    <span class="kpi-label">WASM Binary</span>
+                    <strong id="kpi-wasm-size" class="kpi-value">—</strong>
+                  </div>
+                </div>
+
+                <h3>Stratified Proof Discharge (T0 Interval · T1 Bitwuzla · T2 Z3)</h3>
+                <div id="proof-list" class="proof-list">
+                  <p class="muted">Run verification or select a preset to inspect per-function Z3/Bitwuzla proof telemetry.</p>
+                </div>
+
+                <h3>Layer 1 SpecMut Specification Firewall</h3>
+                <div id="audit-list" class="audit-list">
+                  <p class="muted">No specification audits loaded yet.</p>
+                </div>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-wasm" aria-labelledby="tab-wasm" hidden="until-found">
+              <div class="panel-inner">
+                <div class="sandbox-controls">
+                  <div class="sandbox-row">
+                    <div class="field-group">
+                      <label for="wasm-fn-select">Exported Function</label>
+                      <select id="wasm-fn-select"></select>
+                    </div>
+                    <div class="field-group">
+                      <label for="wasm-iters-select">Benchmark Loops</label>
+                      <select id="wasm-iters-select">
+                        <option value="1">1 call (single)</option>
+                        <option value="1000">1,000 calls</option>
+                        <option value="10000" selected>10,000 calls</option>
+                      </select>
+                    </div>
+                    <button type="button" id="btn-run-wasm" class="btn btn-primary">Execute in Browser WASM</button>
+                  </div>
+
+                  <div id="wasm-args-container" class="wasm-args-grid"></div>
+
+                  <div id="wasm-result-box" class="wasm-result-box" aria-live="polite">
+                    <div class="result-metric">
+                      <span class="muted">Return Value (BigInt)</span>
+                      <strong id="wasm-output" class="mono">—</strong>
+                    </div>
+                    <div class="result-metric">
+                      <span class="muted">Browser Execution Timing</span>
+                      <strong id="wasm-timing" class="mono">—</strong>
+                    </div>
+                  </div>
+                  <pre id="wasm-host-log" class="code-snippet" hidden></pre>
+                </div>
+
+                <div class="code-header">
+                  <h3>WebAssembly Text (<code>.wat</code>)</h3>
+                  <span id="wasm-meta" class="mono muted">0 bytes</span>
+                </div>
+                <pre class="code-scroll"><code id="code-wat">; Compile a verified module to inspect generated WAT and run live WASM in your browser.</code></pre>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-c" aria-labelledby="tab-c" hidden="until-found">
+              <div class="panel-inner">
+                <div class="code-header">
+                  <h3>ISO C11 Zero-Warning Output (<code>-std=c11 -O3 -Wall -Wextra -Werror</code>)</h3>
+                  <button type="button" class="btn btn-ghost btn-copy" data-copy-target="code-c">Copy C11</button>
+                </div>
+                <pre class="code-scroll"><code id="code-c">/* Compile a verified module to inspect generated ISO C11 implementation. */</code></pre>
+                <h3>C ABI Header (<code>.h</code>)</h3>
+                <pre class="code-scroll code-scroll-sm"><code id="code-c-header">/* C ABI declarations appear here. */</code></pre>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-rust" aria-labelledby="tab-rust" hidden="until-found">
+              <div class="panel-inner">
+                <div class="code-header">
+                  <h3>Safe Rust Crate (<code>#![no_std]</code> · <code>#![forbid(unsafe_code)]</code>)</h3>
+                  <button type="button" class="btn btn-ghost btn-copy" data-copy-target="code-rust">Copy Rust</button>
+                </div>
+                <pre class="code-scroll"><code id="code-rust">// Compile a verified module to inspect generated safe #![no_std] Rust code.</code></pre>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-llvm" aria-labelledby="tab-llvm" hidden="until-found">
+              <div class="panel-inner">
+                <div class="code-header">
+                  <h3>Verified LLVM IR (<code>nuw</code> / <code>nsw</code> / <code>noalias</code>)</h3>
+                  <span id="llvm-meta" class="mono muted">NEON: 0 · Atomics: 0</span>
+                </div>
+                <pre class="code-scroll"><code id="code-llvm">; Compile a verified module to inspect LLVM IR.</code></pre>
+                <h3>Native Assembly Preview</h3>
+                <pre class="code-scroll code-scroll-sm"><code id="code-asm">; Native assembly appears when clang is available.</code></pre>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-proto" aria-labelledby="tab-proto" hidden="until-found">
+              <div class="panel-inner">
+                <div class="code-header">
+                  <h3>Protobuf Wire Response (<code>CompilerResponse</code> TextFormat)</h3>
+                  <button type="button" class="btn btn-ghost btn-copy" data-copy-target="code-proto">Copy Prototext</button>
+                </div>
+                <pre class="code-scroll"><code id="code-proto"># Protobuf TextFormat diagnostic &amp; proof report appears here.</code></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card benchmark-section" aria-label="Empirical benchmark comparison">
+      <div class="section-header">
+        <h2>Empirical Token Density, Latency &amp; Static Bug Firewall</h2>
+        <p class="muted">Observed benchmarks on Apple Silicon (<code>-O3</code>) and blind LLM Spec-to-Silicon evaluation (6/6 Turn-1 verified, avg 123.0 tokens).</p>
+      </div>
+
+      <div tabindex="0" role="region" aria-labelledby="benchmark-table-caption" class="table-wrapper">
+        <table class="benchmark-table">
+          <caption id="benchmark-table-caption">AIL v1.0 vs. Rust / C / Python — Token Density (o200k_base), Native Latency &amp; Static Bug Firewall</caption>
+          <thead>
+            <tr>
+              <th scope="col">Kernel</th>
+              <th scope="col">AIL Tokens (.ail.pb)</th>
+              <th scope="col">Rust / C / Python Tokens</th>
+              <th scope="col">AIL Latency</th>
+              <th scope="col">Rust / C / Python Latency</th>
+              <th scope="col">Bug Class Caught Statically</th>
+            </tr>
+          </thead>
+          <tbody id="benchmark-tbody">
+            <tr>
+              <th scope="row">midpoint_u64</th>
+              <td>71 (698 B)</td>
+              <td>48 / 46 / 45</td>
+              <td>1.47 ns/op</td>
+              <td>1.83 / 1.38 / 220.79 ns</td>
+              <td>E_U64_OVERFLOW (at 2^63)</td>
+            </tr>
+            <tr>
+              <th scope="row">settle_fee_net</th>
+              <td>127 (1087 B)</td>
+              <td>112 / 96 / 59</td>
+              <td>1.80 ns/op</td>
+              <td>4.15 / 5.81 / 273.59 ns</td>
+              <td>E_SPEC_MUTANT_SURVIVED</td>
+            </tr>
+            <tr>
+              <th scope="row">halve_bonus_simd</th>
+              <td>87 (621 B)</td>
+              <td>85 / 85 / 58</td>
+              <td>181.58 ns/op</td>
+              <td>182.98 / 181.35 / 55866.46 ns</td>
+              <td>O(1) Bounds + Aliasing</td>
+            </tr>
+            <tr>
+              <th scope="row">quote_net_mid</th>
+              <td>91 (795 B)</td>
+              <td>117 / 100 / 79</td>
+              <td>0.92 ns/op</td>
+              <td>1.82 / 1.83 / 185.61 ns</td>
+              <td>E_STRUCT_INVARIANT_FAILED</td>
+            </tr>
+            <tr>
+              <th scope="row">settle_outcome_dispatch</th>
+              <td>90 (811 B)</td>
+              <td>136 / 93 / 47</td>
+              <td>1.02 ns/op</td>
+              <td>2.08 / 2.27 / 121.78 ns</td>
+              <td>E_NON_EXHAUSTIVE_MATCH</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

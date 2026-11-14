@@ -1,7 +1,7 @@
 """Tier 2: Stratified Z3 Verifier v0.2 (`u64`, `i64`, Dependent `struct`, `cap.io`/`fs`/`net`, `fold`, `atomic_cas`)."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 from typing import Any
 import z3
@@ -13,7 +13,31 @@ from ailang.intervals import Interval, eval_interval
 from ailang.ownership import EnumDef, LINEAR_CAPS, ModuleTypeEnv, StructDef, check_module_ownership_v2
 from ailang.parser import SNode, pretty
 
-Z3Value = z3.ArithRef | z3.BoolRef | dict[str, z3.ArithRef]
+Z3Value = z3.ExprRef | dict[str, z3.ArithRef]
+
+BYTES_SORT = z3.DeclareSort("Bytes")
+Z3_BYTE_AT = z3.Function("ail_byte_at", BYTES_SORT, z3.IntSort(), z3.IntSort())
+Z3_READ_U16_BE = z3.Function("ail_read_u16_be", BYTES_SORT, z3.IntSort(), z3.IntSort())
+Z3_READ_U32_BE = z3.Function("ail_read_u32_be", BYTES_SORT, z3.IntSort(), z3.IntSort())
+Z3_READ_U64_BE = z3.Function("ail_read_u64_be", BYTES_SORT, z3.IntSort(), z3.IntSort())
+Z3_BYTES_EQ4 = z3.Function(
+    "ail_bytes_eq4",
+    BYTES_SORT,
+    z3.IntSort(),
+    z3.IntSort(),
+    z3.IntSort(),
+    z3.IntSort(),
+    z3.IntSort(),
+    z3.IntSort(),
+)
+
+BYTES_OP_SPECS: dict[str, tuple[int, int, z3.FuncDeclRef]] = {
+    "byte_at": (1, 255, Z3_BYTE_AT),
+    "read_u16_be": (2, 65535, Z3_READ_U16_BE),
+    "read_u32_be": (4, 4294967295, Z3_READ_U32_BE),
+    "read_u64_be": (8, U64_MAX, Z3_READ_U64_BE),
+    "bytes_eq4": (4, 1, Z3_BYTES_EQ4),
+}
 
 
 @dataclass
@@ -32,6 +56,7 @@ class FnContractInfo:
     ret_lo: SNode
     ret_hi: SNode
     ensures: list[SNode]
+    bytes_len_params: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -106,10 +131,22 @@ class ModuleVerifier:
         self.fn_ret_ranges: dict[str, tuple[list[str], Any, Any]] = {}
         self.protocols: dict[str, AtomicProtoInfo] = {}
         self.wit_id = 0
+        self._uf_axioms: list[z3.BoolRef] = []
 
     def fresh_int(self, prefix: str) -> z3.ArithRef:
         self.wit_id += 1
         return z3.Int(f"{prefix}_{self.wit_id}")
+
+    def _apply_bytes_uf(self, op: str, buf_sym: Any, idx_v: z3.ArithRef, items: list[SNode]) -> z3.ArithRef:
+        _, max_val, uf = BYTES_OP_SPECS[op]
+        if op == "bytes_eq4":
+            lits = [z3.IntVal(int(a.val)) for a in items[3:7]]
+            res = uf(buf_sym, idx_v, *lits)
+        else:
+            res = uf(buf_sym, idx_v)
+        assert isinstance(res, z3.ArithRef)
+        self._uf_axioms.append(z3.And(res >= 0, res <= max_val))
+        return res
 
     def eval_pure_spec(self, node: SNode, z3_env: dict[str, Z3Value]) -> Z3Value:
         if isinstance(node.val, int):
@@ -211,6 +248,33 @@ class ModuleVerifier:
             sp = self.specs[op]
             senv = {pn: self.eval_pure_spec(arg, z3_env) for pn, arg in zip(sp.params, items[1:])}
             return self.eval_pure_spec(sp.body, senv)
+        if op in BYTES_OP_SPECS:
+            buf_sym = self.eval_pure_spec(items[1], z3_env)
+            idx_v = self.eval_pure_spec(items[2], z3_env)
+            assert isinstance(idx_v, z3.ArithRef)
+            return self._apply_bytes_uf(op, buf_sym, idx_v, items)
+        if op not in (
+            "+",
+            "-",
+            "*",
+            "/",
+            "%",
+            "trunc_div",
+            "trunc_rem",
+            ">>",
+            "min",
+            "max",
+            "==",
+            "!=",
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "and",
+            "or",
+            "not",
+        ):
+            raise NotImplementedError(f"Unsupported pure spec operator `{op}`")
 
         args: list[Any] = [self.eval_pure_spec(a, z3_env) for a in items[1:]]
         if op == "+":
@@ -276,6 +340,7 @@ class ModuleVerifier:
         body_node = items[3] if is_main else items[4]
 
         stats = pb.FunctionProofStats(item_name=name, verified=False)
+        self._uf_axioms = []
         axioms: list[z3.BoolRef] = []
         assumptions: list[z3.BoolRef] = []
         z3_env: dict[str, Z3Value] = {}
@@ -283,6 +348,8 @@ class ModuleVerifier:
         iv_env: dict[str, Interval] = {}
         slice_lengths: dict[str, z3.ArithRef] = {}
         slice_elem_bounds: dict[str, tuple[str, SNode, SNode]] = {}
+        bytes_lengths: dict[str, tuple[str, z3.ArithRef]] = {}
+        bytes_len_params: dict[str, str] = {}
 
         def check_z3(
             code: int,
@@ -297,7 +364,7 @@ class ModuleVerifier:
             stats.tier2_z3_queries += 1
             s = z3.Solver()
             s.set("timeout", 4000)
-            s.add(*assumptions, *(extra_assumptions or []), *axioms, guard, z3.Not(cond))
+            s.add(*assumptions, *(extra_assumptions or []), *axioms, *self._uf_axioms, guard, z3.Not(cond))
             res = s.check()
             if res != z3.unsat:
                 ce: dict[str, int] = {}
@@ -334,6 +401,14 @@ class ModuleVerifier:
                     eval_interval(ehi_n, iv_env, self.fn_ret_ranges).hi,
                 )
                 param_contracts.append((pname, pk, elo_n, ehi_n))
+            elif pk == "bytes":
+                len_var = str(pspec.val[1].val)
+                len_z3 = z3_env[len_var]
+                assert isinstance(len_z3, z3.ArithRef)
+                bytes_lengths[pname] = (len_var, len_z3)
+                bytes_len_params[pname] = len_var
+                z3_env[pname] = z3.Const(f"__bytes_{pname}", BYTES_SORT)
+                param_contracts.append((pname, pk, SNode(0, p.span), SNode("MAX", p.span)))
             elif pk == "atomic_u64":
                 param_contracts.append((pname, pk, SNode(0, p.span), SNode("MAX", p.span)))
             elif pk.startswith("struct:"):
@@ -659,6 +734,24 @@ class ModuleVerifier:
                 axioms.extend([elem >= hw_lo, elem <= hw_hi, elem >= elo_v, elem <= ehi_v])
                 return elem
 
+            if op in BYTES_OP_SPECS:
+                buf_name = str(sub[1].val)
+                idx_v = eval_checked(sub[2], cur_z3, cur_iv, cur_extra, guard)
+                assert isinstance(idx_v, z3.ArithRef)
+                len_var, len_v = bytes_lengths[buf_name]
+                width, _, _ = BYTES_OP_SPECS[op]
+                check_z3(
+                    pb.E_OUT_OF_BOUNDS,
+                    n.span,
+                    pretty(n),
+                    f"`{op}` access at `{pretty(sub[2])}` (+{width} bytes) may exceed `{buf_name}` length `{len_var}`",
+                    guard,
+                    z3.And(idx_v >= 0, idx_v + width <= len_v),
+                    cur_z3,
+                    cur_extra,
+                )
+                return self._apply_bytes_uf(op, cur_z3[buf_name], idx_v, sub)
+
             if op == "fold":
                 stats.o1_loop_steps += 1
                 ivar = str(sub[1].val[0].val)
@@ -740,6 +833,24 @@ class ModuleVerifier:
                 for (pname, pkind, plo_n, phi_n), arg_node in zip(fc.params, sub[2:]):
                     if pkind in ("slice", "mut_slice", "atomic_u64") or pkind in LINEAR_CAPS:
                         continue
+                    if pkind == "bytes":
+                        arg_buf_name = str(arg_node.val)
+                        actual_len_var, actual_len_v = bytes_lengths[arg_buf_name]
+                        callee_len_var = fc.bytes_len_params[pname]
+                        passed_len_v = callee_env[callee_len_var]
+                        assert isinstance(passed_len_v, z3.ArithRef)
+                        check_z3(
+                            pb.E_OUT_OF_BOUNDS,
+                            arg_node.span,
+                            pretty(n),
+                            f"Passed byte slice length `{callee_len_var}` for `{pname}` in call to `{callee}` may exceed `{arg_buf_name}` length `{actual_len_var}`",
+                            guard,
+                            passed_len_v <= actual_len_v,
+                            cur_z3,
+                            cur_extra,
+                        )
+                        callee_env[pname] = cur_z3[arg_buf_name]
+                        continue
                     av = eval_checked(arg_node, cur_z3, cur_iv, cur_extra, guard)
                     callee_env[pname] = av
                     if not pkind.startswith(("struct:", "enum:")):
@@ -820,19 +931,23 @@ class ModuleVerifier:
                         lhs = eval_checked(sub[1], cur_z3, cur_iv, cur_extra, guard)
                         assert isinstance(lhs, z3.ArithRef)
                         return lhs / z3.IntVal(1 << sub[2].val)
+                    bw_args = [eval_checked(a, cur_z3, cur_iv, cur_extra, guard) for a in sub[1:]]
                     bw_wit = self.fresh_int("_bv_out")
                     axioms.extend([bw_wit >= bw_iv.lo, bw_wit <= bw_iv.hi])
                     if op == "&":
-                        lhs = eval_checked(sub[1], cur_z3, cur_iv, cur_extra, guard)
-                        rhs = eval_checked(sub[2], cur_z3, cur_iv, cur_extra, guard)
+                        lhs, rhs = bw_args[0], bw_args[1]
                         assert isinstance(lhs, z3.ArithRef) and isinstance(rhs, z3.ArithRef)
                         axioms.extend([bw_wit <= lhs, bw_wit <= rhs])
+                    elif op == "|":
+                        lhs, rhs = bw_args[0], bw_args[1]
+                        assert isinstance(lhs, z3.ArithRef) and isinstance(rhs, z3.ArithRef)
+                        axioms.extend([bw_wit >= lhs, bw_wit >= rhs])
                     return bw_wit
                 else:
                     # Signed shift range check
+                    bw_args = [eval_checked(a, cur_z3, cur_iv, cur_extra, guard) for a in sub[1:]]
                     if op in (">>", "<<"):
-                        lhs = eval_checked(sub[1], cur_z3, cur_iv, cur_extra, guard)
-                        rhs = eval_checked(sub[2], cur_z3, cur_iv, cur_extra, guard)
+                        lhs, rhs = bw_args[0], bw_args[1]
                         assert isinstance(lhs, z3.ArithRef) and isinstance(rhs, z3.ArithRef)
                         check_z3(pb.E_SHIFT_OUT_OF_RANGE, n.span, pretty(n), "Shift count outside [0..63]", guard, z3.And(rhs >= 0, rhs < 64), cur_z3, cur_extra)
                         if op == ">>" and isinstance(sub[2].val, int):
@@ -964,7 +1079,16 @@ class ModuleVerifier:
                 )
 
         if not is_main:
-            self.fn_contracts[name] = FnContractInfo(name, param_contracts, rname, sig.ret_kind, rlo_n, rhi_n, ensures_list)
+            self.fn_contracts[name] = FnContractInfo(
+                name,
+                param_contracts,
+                rname,
+                sig.ret_kind,
+                rlo_n,
+                rhi_n,
+                ensures_list,
+                bytes_len_params,
+            )
             if not sig.ret_kind.startswith(("struct:", "enum:")):
                 self.fn_ret_ranges[name] = ([p[0] for p in param_contracts], rlo_n.raw(), rhi_n.raw())
 

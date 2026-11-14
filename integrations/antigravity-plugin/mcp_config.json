@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ailang-mcp": {
+      "command": "/opt/homebrew/bin/uv",
+      "args": [
+        "--directory",
+        "/Users/nunoribeiro/repos/ailang",
+        "run",
+        "ail",
+        "mcp"
+      ]
+    }
+  }
+}

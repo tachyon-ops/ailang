@@ -1,0 +1,32 @@
+; Verified 64-bit integer math primitives for ailang stdlib (`stdlib/math`).
+
+(spec spec_midpoint ((a int) (b int)) (/ (+ a b) 2))
+
+(fn midpoint_u64 ((a u64[0..MAX]) (b u64[0..MAX]))
+  (out u64[0..MAX] (== out (spec_midpoint a b)))
+  (let ((lo (min a b)) (hi (max a b)))
+    (+ lo (/ (- hi lo) 2))))
+
+(fn sat_add_u64 ((a u64[0..MAX]) (b u64[0..MAX]))
+  (out u64[0..MAX] (== out (min (+ a b) MAX)))
+  (if (> a (- MAX b)) MAX (+ a b)))
+
+(fn sat_sub_u64 ((a u64[0..MAX]) (b u64[0..MAX]))
+  (out u64[0..MAX] (== out (max (- a b) 0)))
+  (if (< a b) 0 (- a b)))
+
+(fn clamp_u64 ((x u64[0..MAX]) (lo u64[0..MAX]) (hi u64[lo..MAX]))
+  (out u64[lo..hi] (== out (min (max x lo) hi)))
+  (min (max x lo) hi))
+
+(fn clamp_i64 ((x i64) (lo i64) (hi i64[lo..MAX_I64]))
+  (out i64[lo..hi] (== out (min (max x lo) hi)))
+  (min (max x lo) hi))
+
+(fn abs_diff_u64 ((a u64[0..MAX]) (b u64[0..MAX]))
+  (out u64[0..MAX] (== out (if (>= a b) (- a b) (- b a))))
+  (if (>= a b) (- a b) (- b a)))
+
+(fn div_ceil_u64 ((a u64[0..MAX]) (b u64[1..MAX]))
+  (out u64[0..MAX] (== out (if (== a 0) 0 (+ 1 (/ (- a 1) b)))))
+  (if (== a 0) 0 (+ 1 (/ (- a 1) b))))

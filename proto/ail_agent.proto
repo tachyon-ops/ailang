@@ -46,6 +46,8 @@ enum ErrorCode {
   E_NON_EXHAUSTIVE_MATCH = 23;
   E_DUPLICATE_MATCH_ARM = 24;
   E_ENUM_INVARIANT_FAILED = 25;
+  E_IMPORT_CYCLE = 26;
+  E_OUT_OF_BOUNDS = 27;
 }
 
 enum Status {

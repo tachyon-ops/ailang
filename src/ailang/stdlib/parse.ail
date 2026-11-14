@@ -1,0 +1,18 @@
+; Verified zero-copy byte-slice parsing helpers for ailang stdlib (`stdlib/parse`).
+; AIL1 8-byte header layout:
+;   [0..4): "AIL1" (65, 73, 76, 49)
+;   [4]   : version byte (u8)
+;   [5]   : flags / message type byte (u8)
+;   [6..8): payload length (u16 big-endian)
+
+(fn has_ail_magic ((n u64[4..MAX]) (buf (bytes n)))
+  (out u64[0..1] (== out (bytes_eq4 buf 0 65 73 76 49)))
+  (bytes_eq4 buf 0 65 73 76 49))
+
+(fn frame_version_byte ((n u64[5..MAX]) (buf (bytes n)))
+  (out u64[0..255] (== out (byte_at buf 4)))
+  (byte_at buf 4))
+
+(fn frame_payload_len_u16 ((n u64[8..MAX]) (buf (bytes n)))
+  (out u64[0..65535] (== out (read_u16_be buf 6)))
+  (read_u16_be buf 6))

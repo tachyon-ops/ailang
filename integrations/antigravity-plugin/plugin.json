@@ -1,0 +1,13 @@
+{
+  "name": "ailang",
+  "displayName": "AIL Verified Kernel Compiler",
+  "version": "1.0.0",
+  "description": "Formally verified S-expression kernel compiler for AI agents with Z3 + Bitwuzla proofs, SpecMut specification firewall, autonomous AST self-repair, and multi-target LLVM, WebAssembly, C11, and #![no_std] Rust codegen.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Synthesize and prove a verified AIL financial fee kernel, audit specs with SpecMut, and compile to WebAssembly and Rust",
+    "Write a zero-CVE AIL binary wire-frame parser using bounds-checked bytes slices and verify it with Z3 and Bitwuzla",
+    "Audit and autonomously repair a broken AIL module until it passes verification and compiles to native LLVM, C11, and Rust"
+  ],
+  "repository": "https://github.com/tachyon-ops/ailang"
+}

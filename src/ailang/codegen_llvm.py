@@ -301,6 +301,52 @@ class FunctionIREmitter:
             self.lines.append(f"  {val} = load i64, ptr {ptr}, align 8")
             return val
 
+        if op == "byte_at":
+            buf_name = str(items[1].val)
+            idx = self.emit_expr(items[2], env)
+            ptr = self.tmp()
+            b8 = self.tmp()
+            val = self.tmp()
+            self.lines.append(f"  {ptr} = getelementptr inbounds nuw i8, ptr {env[buf_name]}, i64 {idx}")
+            self.lines.append(f"  {b8} = load i8, ptr {ptr}, align 1")
+            self.lines.append(f"  {val} = zext i8 {b8} to i64")
+            return val
+
+        if op in ("read_u16_be", "read_u32_be", "read_u64_be"):
+            buf_name = str(items[1].val)
+            idx = self.emit_expr(items[2], env)
+            width_bits = {"read_u16_be": 16, "read_u32_be": 32, "read_u64_be": 64}[op]
+            ty = f"i{width_bits}"
+            ptr = self.tmp()
+            raw = self.tmp()
+            swapped = self.tmp()
+            self.lines.append(f"  {ptr} = getelementptr inbounds nuw i8, ptr {env[buf_name]}, i64 {idx}")
+            self.lines.append(f"  {raw} = load {ty}, ptr {ptr}, align 1")
+            self.lines.append(f"  {swapped} = call {ty} @llvm.bswap.{ty}({ty} {raw})")
+            if width_bits < 64:
+                val = self.tmp()
+                self.lines.append(f"  {val} = zext {ty} {swapped} to i64")
+                return val
+            return swapped
+
+        if op == "bytes_eq4":
+            buf_name = str(items[1].val)
+            idx = self.emit_expr(items[2], env)
+            b0, b1, b2, b3 = (int(a.val) for a in items[3:7])
+            expected = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+            expected_i32 = expected - (1 << 32) if expected >= (1 << 31) else expected
+            ptr = self.tmp()
+            raw = self.tmp()
+            be_val = self.tmp()
+            cmp_r = self.tmp()
+            val = self.tmp()
+            self.lines.append(f"  {ptr} = getelementptr inbounds nuw i8, ptr {env[buf_name]}, i64 {idx}")
+            self.lines.append(f"  {raw} = load i32, ptr {ptr}, align 1")
+            self.lines.append(f"  {be_val} = call i32 @llvm.bswap.i32(i32 {raw})")
+            self.lines.append(f"  {cmp_r} = icmp eq i32 {be_val}, {expected_i32}")
+            self.lines.append(f"  {val} = zext i1 {cmp_r} to i64")
+            return val
+
         if op == "fold":
             ivar = str(items[1].val[0].val)
             n_val = self.emit_expr(items[1].val[1], env)
@@ -355,7 +401,7 @@ class FunctionIREmitter:
             for arg_node, pk in zip(items[2:], sig.param_kinds):
                 if pk in LINEAR_CAPS:
                     continue  # Zero-cost linear capability erasure!
-                if pk in ("slice", "mut_slice", "atomic_u64"):
+                if pk in ("slice", "mut_slice", "atomic_u64", "bytes"):
                     ir_args.append(f"ptr {env[str(arg_node.val)]}")
                 elif pk.startswith(("struct:", "enum:")):
                     ir_args.append(f"{_ir_type_for_kind(pk)} {self.emit_expr(arg_node, env)}")
@@ -461,7 +507,6 @@ def _emit_fs_runtime_ir() -> list[str]:
 def _emit_net_loopback_runtime_ir(is_darwin: bool) -> list[str]:
     # Hardcoded 127.0.0.1 (`0x0100007f` = 16777343 in little-endian IPv4 network order)
     lines = [
-        "declare i16 @llvm.bswap.i16(i16)",
         "declare i32 @socket(i32 noundef, i32 noundef, i32 noundef) local_unnamed_addr nounwind",
         "declare i64 @sendto(i32 noundef, ptr nocapture noundef readonly, i64 noundef, i32 noundef, ptr nocapture noundef readonly, i32 noundef) local_unnamed_addr nounwind",
         "declare i32 @close(i32 noundef) local_unnamed_addr nounwind",
@@ -540,6 +585,9 @@ def emit_llvm_module(
         "declare i64 @llvm.umax.i64(i64, i64)",
         "declare i64 @llvm.smin.i64(i64, i64)",
         "declare i64 @llvm.smax.i64(i64, i64)",
+        "declare i16 @llvm.bswap.i16(i16)",
+        "declare i32 @llvm.bswap.i32(i32)",
+        "declare i64 @llvm.bswap.i64(i64)",
     ]
 
     for sdef in tenv.structs.values():
@@ -604,6 +652,13 @@ def emit_llvm_module(
                     c_ir_params.append(f"ptr noalias nocapture readonly noundef %{pname}")
                     c_params.append(("const int64_t*" if is_i64_el else "const uint64_t*", pname))
                     py_params.append("ctypes.POINTER(ctypes.c_int64)" if is_i64_el else "ctypes.POINTER(ctypes.c_uint64)")
+                    param_struct_types.append(None)
+                elif pk == "bytes":
+                    pure_mem = False
+                    ssa_ir_params.append(f"ptr noalias nocapture readonly noundef %{pname}")
+                    c_ir_params.append(f"ptr noalias nocapture readonly noundef %{pname}")
+                    c_params.append(("const uint8_t*", pname))
+                    py_params.append("ctypes.POINTER(ctypes.c_uint8)")
                     param_struct_types.append(None)
                 elif pk == "mut_slice":
                     pure_mem = False
@@ -703,7 +758,7 @@ def emit_llvm_module(
                         ename = pk.split(":", 1)[1]
                         wrap_lines.append(f"  %{pname}_val = load %enum.{ename}, ptr %{pname}_ptr, align 8")
                         call_args.append(f"%enum.{ename} %{pname}_val")
-                    elif pk in ("slice", "mut_slice", "atomic_u64"):
+                    elif pk in ("slice", "mut_slice", "atomic_u64", "bytes"):
                         call_args.append(f"ptr %{pname}")
                     else:
                         call_args.append(f"i64 %{pname}")
@@ -772,6 +827,10 @@ def emit_llvm_module(
                     ir_params.append(f"ptr noalias nocapture noundef %{pname}")
                     c_params.append(("int64_t*" if is_i64_el else "uint64_t*", pname))
                     py_params.append("ctypes.POINTER(ctypes.c_int64)" if is_i64_el else "ctypes.POINTER(ctypes.c_uint64)")
+                elif pk == "bytes":
+                    ir_params.append(f"ptr noalias nocapture readonly noundef %{pname}")
+                    c_params.append(("const uint8_t*", pname))
+                    py_params.append("ctypes.POINTER(ctypes.c_uint8)")
                 elif pk == "i64":
                     ir_params.append(f"i64 noundef %{pname}")
                     c_params.append(("int64_t", pname))
@@ -971,14 +1030,17 @@ def generate_python_bindings(
         lines.append(f"_LIB.{ex.name}.argtypes = [{', '.join(ex.params_py)}]")
         lines.append(f"_LIB.{ex.name}.restype = {ex.ret_py}")
         has_struct = (ex.ret_struct_type is not None) or any(s is not None for s in ex.param_struct_types)
-        if not has_struct:
+        has_bytes = any(pt == "ctypes.POINTER(ctypes.c_uint8)" for pt in ex.params_py)
+        if not has_struct and not has_bytes:
             lines.append(f"{ex.name} = _LIB.{ex.name}\n")
         else:
             sig_args = ", ".join(ex.param_names)
             call_exprs: list[str] = []
-            for pn, st in zip(ex.param_names, ex.param_struct_types):
+            for pn, st, pt in zip(ex.param_names, ex.param_struct_types, ex.params_py):
                 if st is not None:
                     call_exprs.append(f"ctypes.byref({pn}) if isinstance({pn}, {st}) else {pn}")
+                elif pt == "ctypes.POINTER(ctypes.c_uint8)":
+                    call_exprs.append(f"((ctypes.c_uint8 * len({pn})).from_buffer_copy({pn}) if isinstance({pn}, (bytes, bytearray, memoryview)) else {pn})")
                 else:
                     call_exprs.append(pn)
             lines.append(f"def {ex.name}({sig_args}):")

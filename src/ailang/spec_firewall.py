@@ -49,10 +49,10 @@ def audit_module_specifications(
         sig = tenv.sigs[fn_name]
         params_node, ret_node, body_node = form.val[2], form.val[3], form.val[4]
 
-        # Audit pure scalar functions (`u64` / `i64` return, scalar/struct/enum inputs without slices or linear caps)
+        # Audit pure scalar functions (`u64` / `i64` return, scalar/struct/enum inputs without slices, bytes, or linear caps)
         if sig.ret_kind in LINEAR_CAPS or sig.ret_kind.startswith(("struct:", "enum:")):
             continue
-        if any(pk in ("slice", "mut_slice", "atomic_u64") or pk in LINEAR_CAPS for pk in sig.param_kinds):
+        if any(pk in ("slice", "mut_slice", "atomic_u64", "bytes") or pk in LINEAR_CAPS for pk in sig.param_kinds):
             continue
 
         t0 = time.perf_counter()

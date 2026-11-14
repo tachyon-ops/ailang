@@ -1,0 +1,28 @@
+; Verified fixed-point bps & market-quote primitives for ailang stdlib (`stdlib/finance`).
+
+(struct Quote2Way
+  ((bid u64[1..1000000000000])
+   (ask u64[bid..1000000000000])))
+
+(fn mul_bps_floor ((amount u64[0..100000000000000]) (bps u64[0..10000]))
+  (out u64[0..amount] (== out (/ (* amount bps) 10000)))
+  (/ (* amount bps) 10000))
+
+(fn net_after_bps_fee ((gross u64[0..100000000000000]) (fee_bps u64[0..10000]))
+  (out u64[0..gross] (== out (- gross (/ (* gross fee_bps) 10000))))
+  (let ((fee (/ (* gross fee_bps) 10000)))
+    (- gross fee)))
+
+(fn maker_rebate_capped
+  ((notional u64[0..100000000000000])
+   (rebate_bps u64[0..10000])
+   (max_rebate u64[0..100000000000000]))
+  (out u64[0..max_rebate] (== out (min (/ (* notional rebate_bps) 10000) max_rebate)))
+  (let ((raw (/ (* notional rebate_bps) 10000)))
+    (min raw max_rebate)))
+
+(fn quote_spread_bps ((q Quote2Way))
+  (out u64[0..MAX]
+    (== out (/ (* (- (field q ask) (field q bid)) 10000) (field q bid))))
+  (let ((b (field q bid)) (a (field q ask)))
+    (/ (* (- a b) 10000) b)))

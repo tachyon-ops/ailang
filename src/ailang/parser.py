@@ -46,26 +46,53 @@ def _is_int_token(s: str) -> bool:
 def tokenize_spanned(src: str) -> list[Token]:
     tokens: list[Token] = []
     for line_idx, raw_line in enumerate(src.splitlines(), start=1):
-        line = raw_line.split(";", 1)[0]
         i = 0
-        n = len(line)
+        n = len(raw_line)
         while i < n:
-            ch = line[i]
+            ch = raw_line[i]
+            if ch == ";":
+                break
             if ch.isspace():
                 i += 1
+                continue
+            if ch == '"':
+                start = i
+                i += 1
+                while i < n:
+                    if raw_line[i] == "\\" and i + 1 < n:
+                        i += 2
+                        continue
+                    if raw_line[i] == '"':
+                        i += 1
+                        break
+                    i += 1
+                else:
+                    raise AILCompilerError(
+                        pb.E_SYNTAX,
+                        pb.STAGE_PARSE,
+                        "<module>",
+                        "Unterminated string literal",
+                        Span(line_idx, start + 1),
+                    )
+                tokens.append(Token(raw_line[start:i], Span(line_idx, start + 1)))
                 continue
             if ch in "()[]":
                 tokens.append(Token(ch, Span(line_idx, i + 1)))
                 i += 1
                 continue
-            if line[i : i + 2] == "..":
+            if raw_line[i : i + 2] == "..":
                 tokens.append(Token("..", Span(line_idx, i + 1)))
                 i += 2
                 continue
             start = i
-            while i < n and (not line[i].isspace()) and (line[i] not in "()[]") and line[i : i + 2] != "..":
+            while (
+                i < n
+                and (not raw_line[i].isspace())
+                and (raw_line[i] not in '()[]";')
+                and raw_line[i : i + 2] != ".."
+            ):
                 i += 1
-            tokens.append(Token(line[start:i], Span(line_idx, start + 1)))
+            tokens.append(Token(raw_line[start:i], Span(line_idx, start + 1)))
     return tokens
 
 

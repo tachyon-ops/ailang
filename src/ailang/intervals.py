@@ -96,6 +96,16 @@ def eval_interval(
         return Interval(I64_MIN, U64_MAX)
     if op == "get":
         return env.get(f"{raw[1]}__elem", Interval(0, U64_MAX))
+    if op == "byte_at":
+        return Interval(0, 255)
+    if op == "read_u16_be":
+        return Interval(0, 65535)
+    if op == "read_u32_be":
+        return Interval(0, 4294967295)
+    if op == "read_u64_be":
+        return Interval(0, U64_MAX)
+    if op == "bytes_eq4":
+        return Interval(0, 1)
     if op in ("io.print_u64", "io.print_i64", "fs.write_u64", "fs.write_i64", "fs.close", "net.loopback_send_u64", "net.close"):
         return Interval(0, 0)
     if op == "io.done":

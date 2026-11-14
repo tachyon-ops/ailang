@@ -4,15 +4,51 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ailang"
-version = "0.1.0"
-description = "AIL: Prototype AI-Native Verified Programming Language, Spec Firewall, Protobuf Agent Protocol, and LLVM Native Compiler"
+version = "1.0.0"
+description = "AIL: AI-Native Formally Verified Programming Language — Protobuf AST, Z3/Bitwuzla Proofs, SpecMut Firewall & Multi-Target LLVM/WASM/C11/Rust Compiler"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
+authors = [
+    { name = "tachyon-ops" },
+]
+keywords = [
+    "ailang",
+    "ai-agents",
+    "formal-verification",
+    "z3",
+    "bitwuzla",
+    "llvm",
+    "webassembly",
+    "c11",
+    "rust",
+    "protobuf",
+    "specification-testing",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = [
     "z3-solver>=4.13.0",
     "bitwuzla>=0.6.0",
     "protobuf>=5.27.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/tachyon-ops/ailang"
+Repository = "https://github.com/tachyon-ops/ailang"
+Issues = "https://github.com/tachyon-ops/ailang/issues"
 
 [project.optional-dependencies]
 dev = [

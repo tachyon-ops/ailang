@@ -102,6 +102,8 @@ def _classify_type(
         return "int"
     if isinstance(raw, list) and len(raw) == 3 and raw[0] in ("slice", "mut_slice"):
         return raw[0]
+    if isinstance(raw, list) and len(raw) == 2 and raw[0] == "bytes" and isinstance(raw[1], str):
+        return "bytes"
     if isinstance(raw, list) and len(raw) == 2 and raw[0] == "atomic" and raw[1] == "u64":
         return "atomic_u64"
     raise AILCompilerError(
@@ -491,6 +493,31 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
             raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, "Slice index must be `u64`", items[2].span, pretty(node))
         return record("u64")
 
+    if op in ("byte_at", "read_u16_be", "read_u32_be", "read_u64_be", "bytes_eq4"):
+        expected_len = 7 if op == "bytes_eq4" else 3
+        if len(items) != expected_len or not isinstance(items[1].val, str):
+            sig_hint = "(bytes_eq4 buf idx b0 b1 b2 b3)" if op == "bytes_eq4" else f"({op} buf idx)"
+            raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, f"Expected `{sig_hint}`", node.span, pretty(node))
+        buf_name = items[1].val
+        if scope.var_kinds.get(buf_name) != "bytes":
+            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{buf_name}` is not a `bytes` slice", items[1].span, pretty(node))
+        tenv.expr_types[id(items[1])] = "bytes"
+        ik = _check_expr(items[2], scope, tenv, in_spec)
+        if not (in_spec and ik == "int") and not _compatible_arg(ik, "u64"):
+            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{op}` index must be `u64`", items[2].span, pretty(node))
+        if op == "bytes_eq4":
+            for bnode in items[3:7]:
+                if not isinstance(bnode.val, int) or bnode.val < 0 or bnode.val > 255:
+                    raise AILCompilerError(
+                        pb.E_TYPE_MISMATCH,
+                        pb.STAGE_OWNERSHIP,
+                        scope.item_name,
+                        f"`bytes_eq4` byte literals must be integers in `[0..255]`, got `{pretty(bnode)}`",
+                        bnode.span,
+                        pretty(node),
+                    )
+        return record("int" if in_spec else "u64")
+
     if op == "fold":
         idx_pair, acc_triple, step_node = items[1], items[2], items[3]
         assert isinstance(idx_pair.val, list) and isinstance(acc_triple.val, list)
@@ -540,6 +567,13 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
                 if expected_k == "mut_slice":
                     has_mut = True
                 seen_slices.add(sname)
+            elif expected_k == "bytes":
+                if not isinstance(arg_node.val, str):
+                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, "`bytes` argument must be a variable", arg_node.span, pretty(arg_node))
+                bname = arg_node.val
+                if scope.var_kinds.get(bname) != "bytes":
+                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{bname}` is not a `bytes` slice", arg_node.span, pretty(arg_node))
+                tenv.expr_types[id(arg_node)] = "bytes"
             elif expected_k in LINEAR_CAPS:
                 ak = _check_expr(arg_node, scope, tenv, in_spec)
                 if ak != expected_k:
@@ -660,6 +694,13 @@ def check_module_ownership_v2(forms: list[SNode]) -> ModuleTypeEnv:
             for p in params_node.val:
                 pname = str(p.val[0].val)
                 pk = _classify_type(p.val[1], tenv.structs, allow_math_int=(head == "spec"), item_name=name, enums=tenv.enums)
+                if pk == "bytes":
+                    len_var = str(p.val[1].val[1].val)
+                    allowed_len = ("u64", "int") if head == "spec" else ("u64",)
+                    if len_var not in scope.var_kinds:
+                        raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, name, f"`(bytes {len_var})` references unknown length parameter `{len_var}`", p.span, pretty(p))
+                    if scope.var_kinds[len_var] not in allowed_len:
+                        raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, name, f"`(bytes {len_var})` length parameter `{len_var}` must be an earlier `u64` parameter", p.span, pretty(p))
                 pkinds.append(pk)
                 scope.bind(pname, pk, p.span)
 

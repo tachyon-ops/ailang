@@ -1,0 +1,38 @@
+name: Verify AIL v1.0 Toolchain
+
+# Restricted strictly to manual dispatch so untrusted public PRs/forks
+# never execute automatically on the self-hosted workstation runner.
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check toolchain availability
+        run: |
+          uv --version
+          python3 --version
+          clang --version
+          rustc --version
+          node --version
+          protoc --version
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
+      - name: Run full pytest suite
+        run: uv run pytest -v
+
+      - name: Smoke-check CLI verification and multi-target build
+        run: |
+          uv run ail stdlib
+          uv run ail check examples/sum_type_settlement.ail
+          uv run ail audit-spec examples/sum_type_settlement.ail
+          uv run ail check examples/wire_frame_parser.ail
+          uv run ail check examples/defi_waterfall_v1.ail
+          uv run ail build --target all examples/sum_type_settlement.ail -o build/ci_settlement
+          uv run ail build --target all examples/wire_frame_parser.ail -o build/ci_wire

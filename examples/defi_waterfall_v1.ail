@@ -1,0 +1,52 @@
+; AIL v1.0 Example: Verified DeFi Yield & Liquidation Waterfall
+; Demonstrates cross-module `(import ...)` composition of `stdlib/finance` and `stdlib/math` with `(const ...)`.
+
+(import "stdlib/finance")
+(import "stdlib/math")
+
+(const PROTOCOL_MAX_FEE_BPS u64 500)
+(const RESERVE_RATIO_BPS u64 2000)
+(const SHARE_ROUNDING_MIN u64 1)
+
+(spec spec_tranche_junior_payout ((gross int) (senior_cap int) (fee_bps int) (reserve_bps int))
+  (let ((net (- gross (/ (* gross fee_bps) 10000)))
+        (fee (- gross net))
+        (reserve (/ (* fee reserve_bps) 10000))
+        (distributable (+ net (- fee reserve)))
+        (senior (min distributable senior_cap)))
+    (max (- distributable senior) 0)))
+
+(fn waterfall_junior_payout
+  ((gross u64[0..100000000000000])
+   (senior_cap u64[0..100000000000000])
+   (fee_bps u64[0..PROTOCOL_MAX_FEE_BPS])
+   (reserve_bps u64[0..RESERVE_RATIO_BPS]))
+  (out u64[0..100000000000000] (== out (spec_tranche_junior_payout gross senior_cap fee_bps reserve_bps)))
+  (let ((net (call net_after_bps_fee gross fee_bps))
+        (fee (call abs_diff_u64 gross net))
+        (reserve (call mul_bps_floor fee reserve_bps))
+        (after_res (call sat_sub_u64 fee reserve))
+        (distributable (call sat_add_u64 net after_res))
+        (senior (call clamp_u64 distributable 0 senior_cap)))
+    (call sat_sub_u64 distributable senior)))
+
+(fn share_price_ceil_per_unit
+  ((total_assets u64[0..100000000000000])
+   (total_shares u64[SHARE_ROUNDING_MIN..100000000000000]))
+  (out u64[0..100000000000000]
+    (== out (if (== total_assets 0) 0 (+ 1 (/ (- total_assets 1) total_shares)))))
+  (call div_ceil_u64 total_assets total_shares))
+
+(spec quote_spread_bps_spec ((q Quote2Way))
+  (/ (* (- (field q ask) (field q bid)) 10000) (field q bid)))
+
+(fn pool_quote_health_check
+  ((q Quote2Way)
+   (notional u64[0..100000000000000])
+   (rebate_bps u64[0..PROTOCOL_MAX_FEE_BPS])
+   (max_rebate u64[0..100000000000000]))
+  (out u64[0..MAX]
+    (== out (+ (quote_spread_bps_spec q) (min (/ (* notional rebate_bps) 10000) max_rebate))))
+  (let ((spread (call quote_spread_bps q))
+        (rebate (call maker_rebate_capped notional rebate_bps max_rebate)))
+    (+ spread rebate)))
