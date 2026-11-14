@@ -1,0 +1,10 @@
+; Sharded Concurrent State Machine (Verus / IronSync style):
+; Proves `vault + disbursed == total` across arbitrary lock-free thread interleavings.
+(atomic_protocol VaultReserve
+  ((vault u64) (disbursed u64) (total u64))
+  (== (+ vault disbursed) total)
+  (step withdraw ((req u64[0..vault]))
+    ((- vault req) (+ disbursed req) total)))
+
+(atomic_cas cas_withdraw VaultReserve withdraw
+  ((vault_ptr (atomic u64)) (req u64[0..1000000000000])))

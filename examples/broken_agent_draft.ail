@@ -1,0 +1,24 @@
+; Intentionally buggy AI-generated draft for `ail repair` closed-loop autonomous repair:
+; 1. `midpoint_draft`: `(+ lo hi)` overflows u64 at 2^63 + weak spec (`E_SPEC_MUTANT_SURVIVED`)
+; 2. `fee_net_draft`: `(* amt bps)` overflows u64 + weak spec (`E_SPEC_MUTANT_SURVIVED`)
+; 3. `rebate_sub_draft`: `(- gross discount)` underflows u64 when discount > gross + weak spec
+; 4. `emit_telemetry`: reuses linear `io` after move (`E_LINEAR_USE_AFTER_MOVE`) AND leaks `fs` (`E_LINEAR_UNCONSUMED`)
+
+(fn midpoint_draft ((lo u64[0..MAX]) (hi u64[lo..MAX]))
+  u64[lo..hi]
+  (/ (+ lo hi) 2))
+
+(fn fee_net_draft ((amt u64[0..10000000000000000]) (bps u64[0..10000]))
+  u64[0..amt]
+  (- amt (/ (* amt bps) 10000)))
+
+(fn rebate_sub_draft ((gross u64[0..1000000]) (discount u64[0..1000000]))
+  u64[0..1000000]
+  (- gross discount))
+
+(fn emit_telemetry ((io cap.io) (fs cap.fs) (v u64[0..1000000]))
+  u64[0..0]
+  (let ((io1 (io.print_u64 io v))
+        (io2 (io.print_u64 io v))
+        (fs1 (fs.write_u64 fs v)))
+    (io.done io2 0)))

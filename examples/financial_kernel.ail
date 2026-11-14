@@ -1,0 +1,42 @@
+; Pure mathematical specifications (unbounded Int, erased at runtime)
+(spec exact_mid ((lo int) (hi int))
+  (+ lo (/ (- hi lo) 2)))
+
+(spec exact_fee ((amt int) (bps int) (cap int))
+  (min cap (/ (* amt bps) 10000)))
+
+; 100% mutant-tight 64-bit kernels
+(fn midpoint
+  ((lo u64[0..MAX]) (hi u64[lo..MAX]))
+  (out u64[lo..hi] (== out (exact_mid lo hi)))
+  (+ lo (/ (- hi lo) 2)))
+
+(fn settle_net
+  ((amt u64[0..10000000000000000]) (bps u64[0..10000]) (cap u64[0..10000000000000000]))
+  (out u64[0..amt]
+    (<= (- amt out) cap)
+    (== (- amt out) (exact_fee amt bps cap)))
+  (- amt (min cap (+ (* (/ amt 10000) bps) (/ (* (% amt 10000) bps) 10000)))))
+
+; Mixed nonlinear arithmetic + 64-bit bitwise cache-line alignment & shard extraction
+(fn aligned_fee_packet
+  ((amt u64[0..10000000000000000]) (bps u64[0..10000]) (cap u64[0..10000000000000000]))
+  u64[0..10000000000008256]
+  (let ((net (call settle_net amt bps cap))
+        (aligned (& (+ net 63) (~ 63)))
+        (shard (& (>> net 6) 8191)))
+    (+ aligned shard)))
+
+; O(1)-verified billion-element slice reduction (zero runtime bounds checks, NEON SIMD)
+(fn batch_cap_sum
+  ((n u64[0..1000000000]) (buf (slice n u64[0..MAX])))
+  u64[0..(* n 10000)]
+  (fold (i n) (acc 0 u64[0..(* i 10000)])
+    (+ acc (min (get buf i) 10000))))
+
+; Linear owned mutable slice kernel (zero heap aliasing axioms, NEON `usra.2d` SIMD)
+(map_inplace halve_bonus_inplace
+  ((n u64[0..1000000000]) (bonus u64[0..1000000]) (cap u64[bonus..1000000000]) (buf (mut_slice n u64[0..1000000000000])))
+  u64[bonus..cap]
+  (x)
+  (min cap (+ (>> x 1) bonus)))

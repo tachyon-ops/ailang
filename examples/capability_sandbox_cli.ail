@@ -1,0 +1,28 @@
+; AIL v0.2 Capability-Sandboxed Standalone Executable (`cap.io` + `cap.fs` + `cap.net`)
+; Zero-cost linear capability tokens enforce exact single-use & explicit handle close at compile time.
+
+(struct Quote
+  ((bid u64[0..1000000000])
+   (ask u64[bid..1000000000])
+   (pnl_adj i64[-50000..50000])))
+
+(fn build_quote ((bid u64[0..999990000]) (spread u64[0..10000]) (pnl_adj i64[-50000..50000]))
+  Quote
+  (make Quote bid (+ bid spread) pnl_adj))
+
+(fn quote_net_mid ((q Quote))
+  i64[-50000..1000050000]
+  (+ (to_i64 (+ (field q bid) (/ (- (field q ask) (field q bid)) 2))) (field q pnl_adj)))
+
+(main ((io cap.io) (fs cap.fs) (net cap.net)) u64[0..0]
+  (let ((q (call build_quote 100000 200 -350))
+        (spread (- (field q ask) (field q bid)))
+        (net_pnl (call quote_net_mid q))
+        (io1 (io.print_u64 io spread))
+        (io2 (io.print_i64 io1 net_pnl))
+        (fs1 (fs.write_u64 fs spread))
+        (fs2 (fs.write_i64 fs1 net_pnl))
+        (f_done (fs.close fs2))
+        (net1 (net.loopback_send_u64 net 49152 spread))
+        (n_done (net.close net1)))
+    (io.done io2 0)))

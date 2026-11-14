@@ -1,0 +1,4 @@
+; Candidate Formalization A: Naive floor clamp `max(100, amt - fee)` (violates `out <= amt` when `amt < 100`!)
+(spec min_payout_settle ((amt int) (bps int) (cap int))
+  (let ((fee (min cap (/ (* amt bps) 10000))))
+    (max 100 (- amt fee))))

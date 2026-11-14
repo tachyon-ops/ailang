@@ -1,0 +1,33 @@
+; AIL v0.2 Discovery Example: Signed `i64` Refinements + Dependent Algebraic `struct`
+; `ask` carries a dependent refinement `u64[bid..1000000000]` referencing `bid` inside `Quote`!
+
+(struct Quote
+  ((bid u64[0..1000000000])
+   (ask u64[bid..1000000000])
+   (pnl_adj i64[-50000..50000])))
+
+(spec exact_spread ((bid int) (ask int))
+  (- ask bid))
+
+(spec exact_net_mid ((bid int) (ask int) (adj int))
+  (+ (+ bid (/ (- ask bid) 2)) adj))
+
+(spec exact_scaled_pnl ((pnl int))
+  (trunc_div pnl 10))
+
+(fn build_quote ((bid u64[0..999990000]) (spread u64[0..10000]) (pnl_adj i64[-50000..50000]))
+  Quote
+  (make Quote bid (+ bid spread) pnl_adj))
+
+; Zero runtime underflow branches needed: Z3 proves `ask >= bid` directly from `Quote`'s dependent type!
+(fn quote_spread ((q Quote))
+  (out u64[0..1000000000] (== out (exact_spread (field q bid) (field q ask))))
+  (- (field q ask) (field q bid)))
+
+(fn quote_net_mid ((q Quote))
+  (out i64[-50000..1000050000] (== out (exact_net_mid (field q bid) (field q ask) (field q pnl_adj))))
+  (+ (to_i64 (+ (field q bid) (/ (- (field q ask) (field q bid)) 2))) (field q pnl_adj)))
+
+(fn scale_signed_pnl ((pnl i64[-1000000..1000000]))
+  (out i64[-100000..100000] (== out (exact_scaled_pnl pnl)))
+  (/ pnl 10))

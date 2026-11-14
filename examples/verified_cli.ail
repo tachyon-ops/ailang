@@ -1,0 +1,17 @@
+; Standalone capability-gated CLI executable (`main`)
+; Linear `cap.io` tokens enforce exact I/O ordering at compile time and erase to 0 bytes at runtime.
+
+(spec exact_fee ((amt int) (bps int) (cap int))
+  (min cap (/ (* amt bps) 10000)))
+
+(fn settle_net
+  ((amt u64[0..10000000000000000]) (bps u64[0..10000]) (cap u64[0..10000000000000000]))
+  (out u64[0..amt] (== (- amt out) (exact_fee amt bps cap)))
+  (- amt (min cap (+ (* (/ amt 10000) bps) (/ (* (% amt 10000) bps) 10000)))))
+
+(main ((io0 cap.io)) u64[0..0]
+  (let ((net1 (call settle_net 1000000 250 50000))
+        (net2 (call settle_net 5000000 250 50000))
+        (io1 (io.print_u64 io0 net1))
+        (io2 (io.print_u64 io1 net2)))
+    (io.done io2 0)))

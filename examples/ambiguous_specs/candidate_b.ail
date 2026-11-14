@@ -1,0 +1,4 @@
+; Candidate Formalization B: Fee waived toward 100, capped by deposit `min(amt, max(100, amt - fee))`
+(spec min_payout_settle ((amt int) (bps int) (cap int))
+  (let ((fee (min cap (/ (* amt bps) 10000))))
+    (min amt (max 100 (- amt fee)))))

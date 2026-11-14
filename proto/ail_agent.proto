@@ -1,0 +1,182 @@
+syntax = "proto3";
+
+package ail.v1;
+
+// ============================================================================
+// 1. Agent <-> Compiler Protocol: Diagnostics, Counterexamples & Audit Reports
+//    Native uint64/int64 avoids IEEE-754 JSON's 2^53 precision corruption!
+// ============================================================================
+
+enum Stage {
+  STAGE_UNSPECIFIED = 0;
+  STAGE_PARSE = 1;
+  STAGE_OWNERSHIP = 2;
+  STAGE_TIER0_INTERVAL = 3;
+  STAGE_TIER1_BITWUZLA = 4;
+  STAGE_TIER2_Z3 = 5;
+  STAGE_SPEC_FIREWALL = 6;
+  STAGE_LLVM_CODEGEN = 7;
+  STAGE_AGENT_REPAIR = 8;
+}
+
+enum ErrorCode {
+  ERROR_NONE = 0;
+  E_SYNTAX = 1;
+  E_UNBOUND_SYMBOL = 2;
+  E_TYPE_MISMATCH = 3;
+  E_LINEAR_USE_AFTER_MOVE = 4;
+  E_LINEAR_UNCONSUMED = 5;
+  E_CAPABILITY_MISSING = 6;
+  E_ALIASING_VIOLATION = 7;
+  E_U64_OVERFLOW = 8;
+  E_U64_UNDERFLOW = 9;
+  E_DIV_BY_ZERO = 10;
+  E_SHIFT_OUT_OF_RANGE = 11;
+  E_SLICE_OUT_OF_BOUNDS = 12;
+  E_PRECONDITION_FAILED = 13;
+  E_POSTCONDITION_FAILED = 14;
+  E_LOOP_BASE_FAILED = 15;
+  E_LOOP_STEP_FAILED = 16;
+  E_ATOMIC_INVARIANT_FAILED = 17;
+  E_SPEC_VACUOUS = 18;
+  E_SPEC_MUTANT_SURVIVED = 19;
+  E_SPEC_AMBIGUITY = 20;
+  E_I64_OVERFLOW = 21;
+  E_STRUCT_INVARIANT_FAILED = 22;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_VERIFIED = 1;
+  STATUS_REJECTED = 2;
+}
+
+message SourceSpan {
+  uint32 line = 1;
+  uint32 column = 2;
+}
+
+message CounterexampleBinding {
+  string name = 1;
+  oneof value {
+    uint64 u64_val = 2;
+    int64 i64_val = 3;
+    string big_int = 4;
+  }
+}
+
+message Diagnostic {
+  ErrorCode code = 1;
+  Stage stage = 2;
+  string item_name = 3;
+  SourceSpan span = 4;
+  string expr = 5;
+  string message = 6;
+  repeated CounterexampleBinding counterexample = 7;
+  string repair_hint = 8;
+}
+
+message FunctionProofStats {
+  string item_name = 1;
+  bool verified = 2;
+  double elapsed_ms = 3;
+  uint32 tier0_interval_discharged = 4;
+  uint32 tier1_bitwuzla_queries = 5;
+  uint32 tier2_z3_queries = 6;
+  uint32 o1_loop_steps = 7;
+}
+
+message SurvivingMutant {
+  string mutant_kind = 1;
+  string mutant_expr = 2;
+  repeated CounterexampleBinding witness = 3;
+  uint64 mutant_output = 4;
+  uint64 reference_output = 5;
+}
+
+message SpecAuditItem {
+  string fn_name = 1;
+  bool non_vacuous = 2;
+  bool uniquely_tight = 3;
+  uint32 mutants_tested = 4;
+  uint32 mutants_killed = 5;
+  double elapsed_ms = 6;
+  repeated SurvivingMutant surviving_mutants = 7;
+}
+
+message SpecDiscrepancy {
+  string fn_name = 1;
+  bool equivalent = 2;
+  double elapsed_ms = 3;
+  repeated CounterexampleBinding distinguishing_input = 4;
+  int64 spec_a_output = 5;
+  int64 spec_b_output = 6;
+  bool spec_a_violates_conservation = 7;
+  bool spec_b_violates_conservation = 8;
+  string clarification_question = 9;
+}
+
+message BuildArtifacts {
+  string llvm_ir_path = 1;
+  string asm_path = 2;
+  string binary_or_lib_path = 3;
+  string c_header_path = 4;
+  string python_bindings_path = 5;
+  uint32 neon_simd_instructions = 6;
+  uint32 hardware_atomic_instructions = 7;
+}
+
+message CompilerResponse {
+  Status status = 1;
+  double total_elapsed_ms = 2;
+  repeated FunctionProofStats proof_stats = 3;
+  repeated Diagnostic diagnostics = 4;
+  repeated SpecAuditItem spec_audits = 5;
+  repeated SpecDiscrepancy spec_diffs = 6;
+  BuildArtifacts artifacts = 7;
+}
+
+// ============================================================================
+// 2. Binary AST Schema (`ModuleProto`): Zero-Syntax-Error Agent Wire Format
+// ============================================================================
+
+message SExprProto {
+  SourceSpan span = 1;
+  oneof node {
+    uint64 u64_lit = 2;
+    string symbol = 3;
+    SExprList list = 4;
+    int64 i64_lit = 5;
+  }
+}
+
+message SExprList {
+  repeated SExprProto items = 1;
+}
+
+message ModuleProto {
+  string module_name = 1;
+  repeated SExprProto declarations = 2;
+}
+
+// ============================================================================
+// 3. Closed-Loop Autonomous Agent Repair Session (`ail repair`)
+// ============================================================================
+
+message RepairStep {
+  uint32 turn = 1;
+  ErrorCode triggered_code = 2;
+  string target_item = 3;
+  string patch_summary = 4;
+  CompilerResponse check_response = 5;
+}
+
+message RepairSession {
+  Status final_status = 1;
+  uint32 iterations = 2;
+  double total_elapsed_ms = 3;
+  string repaired_ail_source = 4;
+  ModuleProto repaired_ast = 5;
+  repeated RepairStep steps = 6;
+  BuildArtifacts artifacts = 7;
+}

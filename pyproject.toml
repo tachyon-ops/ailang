@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ailang"
+version = "0.1.0"
+description = "AIL: Prototype AI-Native Verified Programming Language, Spec Firewall, Protobuf Agent Protocol, and LLVM Native Compiler"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "z3-solver>=4.13.0",
+    "bitwuzla>=0.6.0",
+    "protobuf>=5.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "tiktoken>=0.7.0",
+]
+
+[project.scripts]
+ail = "ailang.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ailang"]
