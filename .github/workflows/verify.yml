@@ -45,3 +45,6 @@ jobs:
 
       - name: Run dogfood-gateway Cargo tests
         run: cargo test --manifest-path integrations/dogfood-gateway/Cargo.toml
+
+      - name: Verify and package Agensi skill bundles
+        run: uv run python integrations/agensi-skills/build_and_verify.py
