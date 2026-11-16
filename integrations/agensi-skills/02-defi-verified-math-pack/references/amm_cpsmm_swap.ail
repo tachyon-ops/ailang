@@ -1,0 +1,57 @@
+; Verified Constant-Product AMM Swap & Protocol Fee Split Kernel
+; Proves overflow safety, strict reserve positivity, and exact slippage protection.
+
+(import "stdlib/finance")
+
+(const BPS_DENOM u64 10000)
+(const MAX_SWAP_FEE_BPS u64 300)
+(const MAX_PROTOCOL_CUT_BPS u64 5000)
+(const MAX_POOL_RESERVE u64 1000000000)
+
+(enum SwapQuote
+  (Executable (amount_out u64[0..MAX_POOL_RESERVE]) (protocol_fee u64[0..MAX_POOL_RESERVE]) (lp_fee u64[0..MAX_POOL_RESERVE]))
+  (SlippageExceeded (quoted_out u64[0..MAX_POOL_RESERVE]) (min_required u64[1..MAX_POOL_RESERVE])))
+
+(spec spec_cpsmm_out ((amount_in int) (res_in int) (res_out int) (fee_bps int))
+  (let ((net_in (- amount_in (/ (* amount_in fee_bps) 10000))))
+    (/ (* res_out net_in) (+ res_in net_in))))
+
+(fn cpsmm_amount_out
+  ((amount_in u64[0..MAX_POOL_RESERVE])
+   (reserve_in u64[1..MAX_POOL_RESERVE])
+   (reserve_out u64[1..MAX_POOL_RESERVE])
+   (fee_bps u64[0..MAX_SWAP_FEE_BPS]))
+  (out u64[0..reserve_out]
+    (== out (spec_cpsmm_out amount_in reserve_in reserve_out fee_bps)))
+  (let ((net_in (call net_after_bps_fee amount_in fee_bps))
+        (num (* reserve_out net_in))
+        (den (+ reserve_in net_in)))
+    (/ num den)))
+
+(spec spec_protocol_fee_share ((amount_in int) (fee_bps int) (proto_cut_bps int))
+  (/ (* (/ (* amount_in fee_bps) 10000) proto_cut_bps) 10000))
+
+(fn swap_protocol_fee
+  ((amount_in u64[0..MAX_POOL_RESERVE])
+   (fee_bps u64[0..MAX_SWAP_FEE_BPS])
+   (proto_cut_bps u64[0..MAX_PROTOCOL_CUT_BPS]))
+  (out u64[0..amount_in]
+    (== out (spec_protocol_fee_share amount_in fee_bps proto_cut_bps)))
+  (let ((total_fee (call mul_bps_floor amount_in fee_bps)))
+    (call mul_bps_floor total_fee proto_cut_bps)))
+
+(fn quote_cpsmm_swap
+  ((amount_in u64[0..MAX_POOL_RESERVE])
+   (reserve_in u64[1..MAX_POOL_RESERVE])
+   (reserve_out u64[1..MAX_POOL_RESERVE])
+   (fee_bps u64[0..MAX_SWAP_FEE_BPS])
+   (proto_cut_bps u64[0..MAX_PROTOCOL_CUT_BPS])
+   (min_out u64[0..MAX_POOL_RESERVE]))
+  SwapQuote
+  (let ((total_fee (call mul_bps_floor amount_in fee_bps))
+        (proto_fee (call mul_bps_floor total_fee proto_cut_bps))
+        (lp_fee (- total_fee proto_fee))
+        (out_amt (call cpsmm_amount_out amount_in reserve_in reserve_out fee_bps)))
+    (if (< out_amt min_out)
+      (variant SwapQuote SlippageExceeded out_amt min_out)
+      (variant SwapQuote Executable out_amt proto_fee lp_fee))))

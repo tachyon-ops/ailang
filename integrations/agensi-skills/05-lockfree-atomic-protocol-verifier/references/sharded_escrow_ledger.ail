@@ -1,0 +1,15 @@
+; Verified Sharded Lock-Free Escrow & Reserve State Machine
+; Proves `available + locked + settled == total_supply` across all concurrent interleavings.
+
+(atomic_protocol EscrowLedger
+  ((available u64) (locked u64) (settled u64) (total_supply u64))
+  (== (+ (+ available locked) settled) total_supply)
+  (step lock_escrow ((req u64[0..available]))
+    ((- available req) (+ locked req) settled total_supply))
+  (step settle_escrow ((amt u64[0..locked]))
+    (available (- locked amt) (+ settled amt) total_supply))
+  (step refund_escrow ((amt u64[0..locked]))
+    ((+ available amt) (- locked amt) settled total_supply)))
+
+(atomic_cas cas_lock_escrow EscrowLedger lock_escrow
+  ((avail_ptr (atomic u64)) (req u64[0..1000000000000])))

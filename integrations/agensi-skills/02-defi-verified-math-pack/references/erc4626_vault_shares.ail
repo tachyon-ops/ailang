@@ -1,0 +1,59 @@
+; Verified ERC-4626 Virtual-Offset Vault Accounting Kernel
+; Proves zero u64 overflow, zero division-by-zero, and exact vault-favoring floor/ceil rounding.
+
+(import "stdlib/math")
+
+(const MAX_VAULT_TVL u64 100000000)
+(const MAX_SHARE_SUPPLY u64 100000000000)
+(const VIRTUAL_ASSETS u64 1)
+(const VIRTUAL_SHARES u64 1000)
+
+(spec spec_mul_div_floor ((a int) (b int) (d int))
+  (/ (* a b) d))
+
+(spec spec_mul_div_ceil ((a int) (b int) (d int))
+  (if (== (* a b) 0)
+    0
+    (+ 1 (/ (- (* a b) 1) d))))
+
+(fn convert_to_shares_floor
+  ((assets u64[0..MAX_VAULT_TVL])
+   (total_assets u64[0..MAX_VAULT_TVL])
+   (total_supply u64[0..MAX_SHARE_SUPPLY]))
+  (out u64[0..MAX]
+    (== out (spec_mul_div_floor assets (+ total_supply VIRTUAL_SHARES) (+ total_assets VIRTUAL_ASSETS))))
+  (let ((eff_supply (+ total_supply VIRTUAL_SHARES))
+        (eff_assets (+ total_assets VIRTUAL_ASSETS)))
+    (/ (* assets eff_supply) eff_assets)))
+
+(fn convert_to_assets_floor
+  ((shares u64[0..MAX_SHARE_SUPPLY])
+   (total_assets u64[0..MAX_VAULT_TVL])
+   (total_supply u64[0..MAX_SHARE_SUPPLY]))
+  (out u64[0..MAX]
+    (== out (spec_mul_div_floor shares (+ total_assets VIRTUAL_ASSETS) (+ total_supply VIRTUAL_SHARES))))
+  (let ((eff_supply (+ total_supply VIRTUAL_SHARES))
+        (eff_assets (+ total_assets VIRTUAL_ASSETS)))
+    (/ (* shares eff_assets) eff_supply)))
+
+(fn preview_mint_assets_ceil
+  ((shares u64[0..MAX_SHARE_SUPPLY])
+   (total_assets u64[0..MAX_VAULT_TVL])
+   (total_supply u64[0..MAX_SHARE_SUPPLY]))
+  (out u64[0..MAX]
+    (== out (spec_mul_div_ceil shares (+ total_assets VIRTUAL_ASSETS) (+ total_supply VIRTUAL_SHARES))))
+  (let ((eff_supply (+ total_supply VIRTUAL_SHARES))
+        (eff_assets (+ total_assets VIRTUAL_ASSETS))
+        (num (* shares eff_assets)))
+    (call div_ceil_u64 num eff_supply)))
+
+(fn preview_withdraw_shares_ceil
+  ((assets u64[0..MAX_VAULT_TVL])
+   (total_assets u64[0..MAX_VAULT_TVL])
+   (total_supply u64[0..MAX_SHARE_SUPPLY]))
+  (out u64[0..MAX]
+    (== out (spec_mul_div_ceil assets (+ total_supply VIRTUAL_SHARES) (+ total_assets VIRTUAL_ASSETS))))
+  (let ((eff_supply (+ total_supply VIRTUAL_SHARES))
+        (eff_assets (+ total_assets VIRTUAL_ASSETS))
+        (num (* assets eff_supply)))
+    (call div_ceil_u64 num eff_assets)))
