@@ -13,7 +13,7 @@ LINEAR_CAPS = {"cap.io", "cap.fs", "cap.net"}
 @dataclass
 class StructFieldDef:
     name: str
-    kind: str  # "u64" | "i64"
+    kind: str  # "u64" | "i64" | "struct:..." | "enum:..."
     type_node: SNode
 
 
@@ -54,6 +54,46 @@ class EnumDef:
     def max_fields(self) -> int:
         return max((len(v.fields) for v in self.variants), default=0)
 
+    def variant_payload_slots(
+        self,
+        vname: str,
+        structs: dict[str, StructDef],
+        enums: dict[str, EnumDef],
+    ) -> int:
+        vdef = self.get_variant(vname)
+        if vdef is None:
+            return 0
+        return sum(kind_u64_slots(fd.kind, structs, enums) for fd in vdef.fields)
+
+    def max_payload_slots(
+        self,
+        structs: dict[str, StructDef],
+        enums: dict[str, EnumDef],
+    ) -> int:
+        return max(
+            (sum(kind_u64_slots(fd.kind, structs, enums) for fd in v.fields) for v in self.variants),
+            default=0,
+        )
+
+
+def kind_u64_slots(
+    kind: str,
+    structs: dict[str, StructDef],
+    enums: dict[str, EnumDef],
+) -> int:
+    """Return the flattened number of 64-bit ABI slots occupied by a scalar, struct, or enum kind."""
+    if kind in ("u64", "i64"):
+        return 1
+    if kind.startswith("struct:"):
+        sname = kind.split(":", 1)[1]
+        sdef = structs[sname]
+        return max(1, sum(kind_u64_slots(fd.kind, structs, enums) for fd in sdef.fields))
+    if kind.startswith("enum:"):
+        ename = kind.split(":", 1)[1]
+        edef = enums[ename]
+        return 1 + edef.max_payload_slots(structs, enums)
+    return 1
+
 
 @dataclass
 class FnSig:
@@ -68,6 +108,7 @@ class ModuleTypeEnv:
     sigs: dict[str, FnSig] = field(default_factory=dict)
     structs: dict[str, StructDef] = field(default_factory=dict)
     enums: dict[str, EnumDef] = field(default_factory=dict)
+    type_order: list[tuple[str, str]] = field(default_factory=list)
     expr_types: dict[int, str] = field(default_factory=dict)  # id(SNode) -> resolved scalar/struct/enum kind
 
 
@@ -102,8 +143,8 @@ def _classify_type(
         return "int"
     if isinstance(raw, list) and len(raw) == 3 and raw[0] in ("slice", "mut_slice"):
         return raw[0]
-    if isinstance(raw, list) and len(raw) == 2 and raw[0] == "bytes" and isinstance(raw[1], str):
-        return "bytes"
+    if isinstance(raw, list) and len(raw) == 2 and raw[0] in ("bytes", "mut_bytes") and isinstance(raw[1], str):
+        return raw[0]
     if isinstance(raw, list) and len(raw) == 2 and raw[0] == "atomic" and raw[1] == "u64":
         return "atomic_u64"
     raise AILCompilerError(
@@ -307,7 +348,7 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
             raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{sname}` has {len(sdef.fields)} fields, got {len(fargs)}", node.span, pretty(node))
         for fa, fd in zip(fargs, sdef.fields):
             ak = _check_expr(fa, scope, tenv, in_spec)
-            if not _compatible_arg(ak, fd.kind):
+            if not (_compatible_arg(ak, fd.kind) or (in_spec and ak == "int" and fd.kind in ("u64", "i64"))):
                 raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"Field `{fd.name}` expects `{fd.kind}`, got `{ak}`", fa.span, pretty(node))
         return record(f"struct:{sname}")
 
@@ -322,7 +363,8 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
         found = tenv.structs[sname].get_field(fname)
         if not found:
             raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, scope.item_name, f"Struct `{sname}` has no field `{fname}`", items[2].span, pretty(node))
-        return record("int" if in_spec else found[1].kind)
+        fk = found[1].kind
+        return record(fk if fk.startswith(("struct:", "enum:")) else ("int" if in_spec else fk))
 
     # Algebraic Sum Types: `(variant EnumName VariantName arg0 ...)`, `(is_variant expr VariantName)`, `(match scrut arm1 ...)`
     if op == "variant":
@@ -348,7 +390,7 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
             )
         for va, fd in zip(vargs, vdef.fields):
             ak = _check_expr(va, scope, tenv, in_spec)
-            if not _compatible_arg(ak, fd.kind):
+            if not (_compatible_arg(ak, fd.kind) or (in_spec and ak == "int" and fd.kind in ("u64", "i64"))):
                 raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"Variant field `{fd.name}` expects `{fd.kind}`, got `{ak}`", va.span, pretty(node))
         return record(f"enum:{ename}")
 
@@ -407,7 +449,8 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
                 for bnode, fd in zip(bindings, vdef.fields):
                     if not isinstance(bnode.val, str):
                         raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, "Match pattern binding must be a variable name", bnode.span, pretty(pat))
-                    arm_scope.bind(bnode.val, "int" if in_spec else fd.kind, bnode.span)
+                    bk = fd.kind if fd.kind.startswith(("struct:", "enum:")) else ("int" if in_spec else fd.kind)
+                    arm_scope.bind(bnode.val, bk, bnode.span)
                 seen_variants.add(vname)
             else:
                 raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, f"Malformed match pattern `{pretty(pat)}`", pat.span, pretty(arm))
@@ -493,15 +536,16 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
             raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, "Slice index must be `u64`", items[2].span, pretty(node))
         return record("u64")
 
-    if op in ("byte_at", "read_u16_be", "read_u32_be", "read_u64_be", "bytes_eq4"):
+    if op in ("byte_at", "read_u16_be", "read_u32_be", "read_u64_be", "read_u16_le", "read_u32_le", "read_u64_le", "bytes_eq4"):
         expected_len = 7 if op == "bytes_eq4" else 3
         if len(items) != expected_len or not isinstance(items[1].val, str):
             sig_hint = "(bytes_eq4 buf idx b0 b1 b2 b3)" if op == "bytes_eq4" else f"({op} buf idx)"
             raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, f"Expected `{sig_hint}`", node.span, pretty(node))
         buf_name = items[1].val
-        if scope.var_kinds.get(buf_name) != "bytes":
-            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{buf_name}` is not a `bytes` slice", items[1].span, pretty(node))
-        tenv.expr_types[id(items[1])] = "bytes"
+        buf_kind = scope.var_kinds.get(buf_name)
+        if buf_kind not in ("bytes", "mut_bytes"):
+            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{buf_name}` is not a `bytes` or `mut_bytes` slice", items[1].span, pretty(node))
+        tenv.expr_types[id(items[1])] = buf_kind
         ik = _check_expr(items[2], scope, tenv, in_spec)
         if not (in_spec and ik == "int") and not _compatible_arg(ik, "u64"):
             raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{op}` index must be `u64`", items[2].span, pretty(node))
@@ -518,12 +562,38 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
                     )
         return record("int" if in_spec else "u64")
 
+    if op in ("write_byte", "write_u16_be", "write_u32_be", "write_u64_be", "write_u16_le", "write_u32_le", "write_u64_le"):
+        if in_spec:
+            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"Cannot invoke `{op}` inside `(spec ...)`", node.span, pretty(node))
+        if len(items) != 4 or not isinstance(items[1].val, str):
+            raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, f"Expected `({op} mut_buf idx val)`", node.span, pretty(node))
+        buf_name = items[1].val
+        if scope.var_kinds.get(buf_name) != "mut_bytes":
+            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{buf_name}` is not a `mut_bytes` slice", items[1].span, pretty(node))
+        tenv.expr_types[id(items[1])] = "mut_bytes"
+        ik = _check_expr(items[2], scope, tenv, in_spec)
+        if not _compatible_arg(ik, "u64"):
+            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{op}` index must be `u64`", items[2].span, pretty(node))
+        vk = _check_expr(items[3], scope, tenv, in_spec)
+        if not _compatible_arg(vk, "u64"):
+            raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{op}` value must be `u64`", items[3].span, pretty(node))
+        return record("u64")
+
+    if op in ("mul_div_u64", "mul_div_ceil_u64"):
+        if len(items) != 4:
+            raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, scope.item_name, f"Expected `({op} a b denom)`", node.span, pretty(node))
+        for arg_n in items[1:]:
+            ak = _check_expr(arg_n, scope, tenv, in_spec)
+            if not in_spec and not _compatible_arg(ak, "u64"):
+                raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{op}` expects `u64` arguments, got `{ak}`", arg_n.span, pretty(node))
+        return record("int" if in_spec else "u64")
+
     if op == "fold":
         idx_pair, acc_triple, step_node = items[1], items[2], items[3]
         assert isinstance(idx_pair.val, list) and isinstance(acc_triple.val, list)
         ivar = str(idx_pair.val[0].val)
         avar = str(acc_triple.val[0].val)
-        acc_kind = _classify_type(acc_triple.val[2], tenv.structs, False, scope.item_name)
+        acc_kind = _classify_type(acc_triple.val[2], tenv.structs, False, scope.item_name, tenv.enums)
         bk = _check_expr(idx_pair.val[1], scope, tenv, in_spec)
         if not _compatible_arg(bk, "u64"):
             raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, "`fold` bound must be `u64`", idx_pair.span, pretty(node))
@@ -554,6 +624,8 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
             raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{callee}` expects {len(sig.param_kinds)} args, got {len(call_args)}", node.span, pretty(node))
         seen_slices: set[str] = set()
         has_mut = False
+        seen_bytes: set[str] = set()
+        has_mut_bytes = False
         for arg_node, expected_k in zip(call_args, sig.param_kinds):
             if expected_k in ("slice", "mut_slice"):
                 if not isinstance(arg_node.val, str):
@@ -567,13 +639,21 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
                 if expected_k == "mut_slice":
                     has_mut = True
                 seen_slices.add(sname)
-            elif expected_k == "bytes":
+            elif expected_k in ("bytes", "mut_bytes"):
                 if not isinstance(arg_node.val, str):
-                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, "`bytes` argument must be a variable", arg_node.span, pretty(arg_node))
+                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{expected_k}` argument must be a variable", arg_node.span, pretty(arg_node))
                 bname = arg_node.val
-                if scope.var_kinds.get(bname) != "bytes":
+                actual_k = scope.var_kinds.get(bname)
+                if expected_k == "mut_bytes" and actual_k != "mut_bytes":
+                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{bname}` is not a `mut_bytes` slice", arg_node.span, pretty(arg_node))
+                if expected_k == "bytes" and actual_k not in ("bytes", "mut_bytes"):
                     raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, scope.item_name, f"`{bname}` is not a `bytes` slice", arg_node.span, pretty(arg_node))
-                tenv.expr_types[id(arg_node)] = "bytes"
+                if bname in seen_bytes and (expected_k == "mut_bytes" or has_mut_bytes):
+                    raise AILCompilerError(pb.E_ALIASING_VIOLATION, pb.STAGE_OWNERSHIP, scope.item_name, f"Mutable byte slice aliasing forbidden on `{bname}`", arg_node.span, pretty(node))
+                if expected_k == "mut_bytes":
+                    has_mut_bytes = True
+                seen_bytes.add(bname)
+                tenv.expr_types[id(arg_node)] = str(actual_k)
             elif expected_k in LINEAR_CAPS:
                 ak = _check_expr(arg_node, scope, tenv, in_spec)
                 if ak != expected_k:
@@ -620,7 +700,18 @@ def _check_expr(node: SNode, scope: LinearScope, tenv: ModuleTypeEnv, in_spec: b
         k1 = _check_expr(items[1], scope, tenv, in_spec)
         k2 = _check_expr(items[2], scope, tenv, in_spec)
         if not in_spec:
-            _unify_numeric(k1, k2, node.span, scope.item_name, pretty(node))
+            if op in ("==", "!=") and (k1.startswith(("struct:", "enum:")) or k2.startswith(("struct:", "enum:"))):
+                if k1 != k2:
+                    raise AILCompilerError(
+                        pb.E_TYPE_MISMATCH,
+                        pb.STAGE_OWNERSHIP,
+                        scope.item_name,
+                        f"Cannot compare `{k1}` and `{k2}`",
+                        node.span,
+                        pretty(node),
+                    )
+            else:
+                _unify_numeric(k1, k2, node.span, scope.item_name, pretty(node))
         return record("bool")
 
     if op in ("and", "or", "not"):
@@ -647,10 +738,11 @@ def check_module_ownership_v2(forms: list[SNode]) -> ModuleTypeEnv:
             for f in fields_node.val:
                 fname = str(f.val[0].val)
                 fk = _classify_type(f.val[1], tenv.structs, False, sname, tenv.enums)
-                if fk not in ("u64", "i64"):
-                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, sname, "Struct fields must be `u64` or `i64` refinements", f.span, pretty(f))
+                if fk not in ("u64", "i64") and not fk.startswith(("struct:", "enum:")):
+                    raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, sname, "Struct fields must be `u64`, `i64`, `struct`, or `enum` types", f.span, pretty(f))
                 fdefs.append(StructFieldDef(fname, fk, f.val[1]))
             tenv.structs[sname] = StructDef(sname, fdefs, form.span)
+            tenv.type_order.append(("struct", sname))
             continue
 
         if head == "enum":
@@ -672,11 +764,12 @@ def check_module_ownership_v2(forms: list[SNode]) -> ModuleTypeEnv:
                         raise AILCompilerError(pb.E_SYNTAX, pb.STAGE_PARSE, ename, f"Malformed field in variant `{vname}`", fld.span, pretty(fld))
                     fname = str(fld.val[0].val)
                     fk = _classify_type(fld.val[1], tenv.structs, False, ename, tenv.enums)
-                    if fk not in ("u64", "i64"):
-                        raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, ename, "Enum variant fields must be `u64` or `i64` refinements", fld.span, pretty(fld))
+                    if fk not in ("u64", "i64") and not fk.startswith(("struct:", "enum:")):
+                        raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, ename, "Enum variant fields must be `u64`, `i64`, `struct`, or `enum` types", fld.span, pretty(fld))
                     vfdefs.append(StructFieldDef(fname, fk, fld.val[1]))
                 vdefs.append(EnumVariantDef(vname, tag_idx, vfdefs, vform.span))
             tenv.enums[ename] = EnumDef(ename, vdefs, form.span)
+            tenv.type_order.append(("enum", ename))
             continue
 
         if head == "atomic_protocol":
@@ -694,13 +787,13 @@ def check_module_ownership_v2(forms: list[SNode]) -> ModuleTypeEnv:
             for p in params_node.val:
                 pname = str(p.val[0].val)
                 pk = _classify_type(p.val[1], tenv.structs, allow_math_int=(head == "spec"), item_name=name, enums=tenv.enums)
-                if pk == "bytes":
+                if pk in ("bytes", "mut_bytes"):
                     len_var = str(p.val[1].val[1].val)
                     allowed_len = ("u64", "int") if head == "spec" else ("u64",)
                     if len_var not in scope.var_kinds:
-                        raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, name, f"`(bytes {len_var})` references unknown length parameter `{len_var}`", p.span, pretty(p))
+                        raise AILCompilerError(pb.E_UNBOUND_SYMBOL, pb.STAGE_OWNERSHIP, name, f"`({pk} {len_var})` references unknown length parameter `{len_var}`", p.span, pretty(p))
                     if scope.var_kinds[len_var] not in allowed_len:
-                        raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, name, f"`(bytes {len_var})` length parameter `{len_var}` must be an earlier `u64` parameter", p.span, pretty(p))
+                        raise AILCompilerError(pb.E_TYPE_MISMATCH, pb.STAGE_OWNERSHIP, name, f"`({pk} {len_var})` length parameter `{len_var}` must be an earlier `u64` parameter", p.span, pretty(p))
                 pkinds.append(pk)
                 scope.bind(pname, pk, p.span)
 

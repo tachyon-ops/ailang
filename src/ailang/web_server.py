@@ -29,7 +29,7 @@ from ailang.parser import SNode, parse_source, pretty
 from ailang.spec_firewall import audit_module_specifications
 from ailang.verifier import ModuleVerifier
 
-STUDIO_VERSION = "1.0.0"
+STUDIO_VERSION = "1.1.0"
 MAX_REQUEST_BYTES = 1024 * 1024  # 1 MiB safety limit for JSON payloads
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WEB_DIR = REPO_ROOT / "web"
@@ -179,6 +179,26 @@ def get_presets() -> list[dict[str, Any]]:
             "sample_call": {"fn": "midpoint_draft", "args": ["9223372036854775808", "9223372036854775810"]},
             "source": _read_example_or_fallback("broken_agent_draft.ail", ""),
         },
+        {
+            "id": "wire_codec_v1_1",
+            "title": "Wire Codec v1.1",
+            "subtitle": "Type aliases, nested PacketMeta in DecodedPacket, 128-bit mul_bps_wide_u64 & mut_bytes writer",
+            "tags": ["v1.1", "mut_bytes", "mul_div_u64", "nested-adt"],
+            "expect_error": False,
+            "require_tight_specs": False,
+            "sample_call": {
+                "fn": "encode_v1_1_packet",
+                "args": [
+                    "24",
+                    "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0",
+                    "3",
+                    "42",
+                    "1000000",
+                    "25",
+                ],
+            },
+            "source": _read_example_or_fallback("wire_codec_v1_1.ail", ""),
+        },
     ]
 
 
@@ -327,7 +347,7 @@ def _extract_module_interface(forms: list[SNode], tenv: ModuleTypeEnv) -> dict[s
                 pkind = sig.param_kinds[idx] if sig and idx < len(sig.param_kinds) else "u64"
                 params.append({"name": pname, "kind": pkind, "type_str": pretty(p.val[1])})
             ret_kind = sig.ret_kind if sig else "u64"
-            scalar_ok = all(pm["kind"] in ("u64", "i64", "bytes") for pm in params) and ret_kind in ("u64", "i64")
+            scalar_ok = all(pm["kind"] in ("u64", "i64", "bytes", "mut_bytes") for pm in params) and ret_kind in ("u64", "i64")
             functions.append(
                 {
                     "name": fname,
@@ -871,3 +891,18 @@ def serve_studio(
         pass
     finally:
         srv.server_close()
+
+
+def export_static_site(out_dir: Path, web_dir: Path | None = None) -> dict[str, Any]:
+    """Export standalone static Web Studio site (HTML/CSS/JS + regenerated demos.json)."""
+    import shutil
+
+    src_dir = (web_dir or DEFAULT_WEB_DIR).resolve()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for asset_name in ("index.html", "styles.css", "app.js"):
+        src_asset = src_dir / asset_name
+        if src_asset.exists():
+            shutil.copy2(src_asset, out_dir / asset_name)
+    (out_dir / ".nojekyll").write_text("", encoding="utf-8")
+    return generate_static_demos(out_path=out_dir / "demos.json")

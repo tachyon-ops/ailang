@@ -27,7 +27,7 @@ from ailang.spec_firewall import audit_module_specifications, diff_candidate_mod
 from ailang.verifier import ModuleVerifier
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "ailang-mcp", "version": "1.0.0"}
+SERVER_INFO = {"name": "ailang-mcp", "version": "1.1.0"}
 STDLIB_DIR = Path(__file__).resolve().parent / "stdlib"
 VALID_TARGETS = ("native", "wasm", "c", "rust", "all")
 
@@ -663,7 +663,62 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "ail_fuzz_targets",
+        "description": (
+            "Differentially fuzz all pure exported functions in an AIL module across all 4 compiled "
+            "targets (native LLVM, WebAssembly, ISO C11, and #![no_std] Rust) and verify zero bit-level mismatches."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Inline AIL S-expression source code."},
+                "path": {"type": "string", "description": "Filesystem path to an .ail module file."},
+                "cases": {"type": "integer", "description": "Number of test cases per function (default: 32)."},
+                "seed": {"type": "integer", "description": "Deterministic PRNG seed (default: 42)."},
+                "out_dir": {"type": "string", "description": "Optional output directory for compiled targets."},
+            },
+        },
+    },
 ]
+
+
+def _tool_fuzz_targets(args: dict[str, Any]) -> dict[str, Any]:
+    import tempfile
+    from ailang.diff_fuzz import run_differential_fuzz
+
+    source = args.get("source")
+    path = args.get("path")
+    cases = int(args.get("cases", 32))
+    seed = int(args.get("seed", 42))
+    out_dir_arg = args.get("out_dir")
+
+    resp, _forms, _tenv, stem = _verify_forms(source=source, path=path)
+    if resp.status != pb.STATUS_VERIFIED:
+        return _compiler_response_to_dict(resp, include_prototext=False)
+
+    def _run_in(target_dir: Path) -> dict[str, Any]:
+        rep = run_differential_fuzz(
+            str(source) if source else Path(str(path)).expanduser(),
+            target_dir,
+            cases=cases,
+            seed=seed,
+            is_source=bool(source),
+            stem=stem,
+        )
+        out = rep.to_dict()
+        out["status"] = "STATUS_VERIFIED" if rep.mismatches == 0 else "STATUS_REJECTED"
+        out["human_summary"] = (
+            f"[{'DIFF_FUZZ_PASS' if rep.mismatches == 0 else 'DIFF_FUZZ_FAIL'}] "
+            f"module={rep.stem} seed={rep.seed} executions={rep.total_executions} mismatches={rep.mismatches}"
+        )
+        return out
+
+    if out_dir_arg:
+        return _run_in(Path(str(out_dir_arg)).expanduser())
+    with tempfile.TemporaryDirectory(prefix="ail_mcp_fuzz_") as tmp_dir:
+        return _run_in(Path(tmp_dir))
+
 
 TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "ail_check_and_prove": _tool_check_and_prove,
@@ -671,6 +726,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "ail_repair_code": _tool_repair_code,
     "ail_compile_target": _tool_compile_target,
     "ail_stdlib_catalog": _tool_stdlib_catalog,
+    "ail_fuzz_targets": _tool_fuzz_targets,
 }
 
 
@@ -827,7 +883,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("ailang-mcp: JSON-RPC 2.0 stdio MCP server for AIL\n")
         return 0
     if any(a == "--version" for a in args):
-        sys.stderr.write("ailang-mcp 1.0.0\n")
+        sys.stderr.write("ailang-mcp 1.1.0\n")
         return 0
     return run_stdio_server(sys.stdin, sys.stdout)
 

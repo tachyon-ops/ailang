@@ -1,7 +1,7 @@
 {
   "name": "ailang",
   "displayName": "AIL Verified Kernel Compiler",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Formally verified S-expression kernel compiler for AI agents with Z3 + Bitwuzla proofs, SpecMut specification firewall, autonomous AST self-repair, and multi-target LLVM, WebAssembly, C11, and #![no_std] Rust codegen.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

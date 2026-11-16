@@ -52,56 +52,26 @@ def audit_module_specifications(
         # Audit pure scalar functions (`u64` / `i64` return, scalar/struct/enum inputs without slices, bytes, or linear caps)
         if sig.ret_kind in LINEAR_CAPS or sig.ret_kind.startswith(("struct:", "enum:")):
             continue
-        if any(pk in ("slice", "mut_slice", "atomic_u64", "bytes") or pk in LINEAR_CAPS for pk in sig.param_kinds):
+        if any(pk in ("slice", "mut_slice", "atomic_u64", "bytes", "mut_bytes") or pk in LINEAR_CAPS for pk in sig.param_kinds):
             continue
 
         t0 = time.perf_counter()
-        env: dict[str, z3.ArithRef | dict[str, z3.ArithRef]] = {}
+        env: dict[str, z3.ExprRef | dict[str, object]] = {}
         scalar_vars: dict[str, z3.ArithRef] = {}
         scalar_param_names: list[str] = []
         pre: list[z3.BoolRef] = []
 
         for p, pk in zip(params_node.val, sig.param_kinds):
             pname = str(p.val[0].val)
-            if pk.startswith("struct:"):
-                sname = pk.split(":", 1)[1]
-                sdef = tenv.structs[sname]
-                fdict: dict[str, z3.ArithRef] = {}
-                fscope = dict(env)
-                for fd in sdef.fields:
-                    fv = z3.Int(f"{pname}.{fd.name}")
-                    flo_n, fhi_n = _extract_range_nodes(fd.type_node)
-                    hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
-                    pre.extend([fv >= hw_lo, fv <= hw_hi, fv >= mv.eval_pure_spec(flo_n, fscope), fv <= mv.eval_pure_spec(fhi_n, fscope)])
-                    fdict[fd.name] = fv
-                    fscope[fd.name] = fv
-                    scalar_vars[f"{pname}.{fd.name}"] = fv
-                env[pname] = fdict
-            elif pk.startswith("enum:"):
-                ename = pk.split(":", 1)[1]
-                edef = tenv.enums[ename]
-                edict: dict[str, z3.ArithRef] = {}
-                tag_v = z3.Int(f"{pname}.__tag__")
-                pre.extend([tag_v >= 0, tag_v < len(edef.variants)])
-                edict["__tag__"] = tag_v
-                scalar_vars[f"{pname}.__tag__"] = tag_v
-                for vdef in edef.variants:
-                    vscope = dict(env)
-                    for fidx, fd in enumerate(vdef.fields):
-                        fv = z3.Int(f"{pname}.{vdef.name}.{fd.name}")
-                        flo_n, fhi_n = _extract_range_nodes(fd.type_node)
-                        hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
-                        pre.extend(
-                            [
-                                fv >= hw_lo,
-                                fv <= hw_hi,
-                                z3.Implies(tag_v == vdef.tag, z3.And(fv >= mv.eval_pure_spec(flo_n, vscope), fv <= mv.eval_pure_spec(fhi_n, vscope))),
-                            ]
-                        )
-                        edict[f"{vdef.tag}:{vdef.name}.{fidx}"] = fv
-                        vscope[fd.name] = fv
-                        scalar_vars[f"{pname}.{vdef.name}.{fd.name}"] = fv
-                env[pname] = edict
+            if pk.startswith(("struct:", "enum:")):
+                env[pname] = mv.make_symbolic_value(
+                    pname,
+                    pk,
+                    pre,
+                    env,
+                    scalar_vars,
+                    fresh_sym=False,
+                )
             else:
                 lo_n, hi_n = _extract_range_nodes(p.val[1])
                 v = z3.Int(pname)

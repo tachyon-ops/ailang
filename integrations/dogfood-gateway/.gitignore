@@ -1,0 +1,2 @@
+target/
+crates/ail_gateway_kernel/*.rlib

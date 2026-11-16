@@ -98,14 +98,22 @@ def eval_interval(
         return env.get(f"{raw[1]}__elem", Interval(0, U64_MAX))
     if op == "byte_at":
         return Interval(0, 255)
-    if op == "read_u16_be":
+    if op in ("read_u16_be", "read_u16_le"):
         return Interval(0, 65535)
-    if op == "read_u32_be":
+    if op in ("read_u32_be", "read_u32_le"):
         return Interval(0, 4294967295)
-    if op == "read_u64_be":
+    if op in ("read_u64_be", "read_u64_le"):
         return Interval(0, U64_MAX)
     if op == "bytes_eq4":
         return Interval(0, 1)
+    if op == "write_byte":
+        return Interval(1, 1)
+    if op in ("write_u16_be", "write_u16_le"):
+        return Interval(2, 2)
+    if op in ("write_u32_be", "write_u32_le"):
+        return Interval(4, 4)
+    if op in ("write_u64_be", "write_u64_le"):
+        return Interval(8, 8)
     if op in ("io.print_u64", "io.print_i64", "fs.write_u64", "fs.write_i64", "fs.close", "net.loopback_send_u64", "net.close"):
         return Interval(0, 0)
     if op == "io.done":
@@ -164,6 +172,16 @@ def eval_interval(
         return Interval(min(args[0].lo, args[1].lo), min(args[0].hi, args[1].hi))
     if op == "max":
         return Interval(max(args[0].lo, args[1].lo), max(args[0].hi, args[1].hi))
+    if op == "mul_div_u64":
+        if args[0].lo >= 0 and args[1].lo >= 0 and args[2].lo > 0:
+            return Interval((args[0].lo * args[1].lo) // args[2].hi, (args[0].hi * args[1].hi) // args[2].lo)
+        return Interval(0, U64_MAX)
+    if op == "mul_div_ceil_u64":
+        if args[0].lo >= 0 and args[1].lo >= 0 and args[2].lo > 0:
+            lo_q = (args[0].lo * args[1].lo + args[2].hi - 1) // args[2].hi
+            hi_q = (args[0].hi * args[1].hi + args[2].lo - 1) // args[2].lo
+            return Interval(lo_q, hi_q)
+        return Interval(0, U64_MAX)
     if op == "&":
         if args[0].lo >= 0 and args[1].lo >= 0:
             return Interval(0, min(args[0].hi, args[1].hi))

@@ -1,0 +1,9 @@
+[package]
+name = "gateway_kernel"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "gateway_kernel"
+path = "src/lib.rs"
+crate-type = ["rlib"]

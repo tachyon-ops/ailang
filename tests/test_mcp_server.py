@@ -104,7 +104,7 @@ def test_mcp_stdio_roundtrip_subprocess(tmp_path: Path) -> None:
     assert init_resp["id"] == 1
     assert init_resp["result"]["protocolVersion"] == "2024-11-05"
     assert init_resp["result"]["capabilities"] == {"tools": {}}
-    assert init_resp["result"]["serverInfo"] == {"name": "ailang-mcp", "version": "1.0.0"}
+    assert init_resp["result"]["serverInfo"] == {"name": "ailang-mcp", "version": "1.1.0"}
 
     ping_resp = json.loads(lines[1])
     assert ping_resp == {"jsonrpc": "2.0", "id": 2, "result": {}}
@@ -118,6 +118,7 @@ def test_mcp_stdio_roundtrip_subprocess(tmp_path: Path) -> None:
         "ail_repair_code",
         "ail_compile_target",
         "ail_stdlib_catalog",
+        "ail_fuzz_targets",
     }
 
     call_resp = json.loads(lines[3])
@@ -367,20 +368,21 @@ def test_mcp_ail_cli_entrypoint_stdio() -> None:
     assert json.loads(lines[0])["result"]["serverInfo"]["name"] == "ailang-mcp"
     cat = json.loads(json.loads(lines[1])["result"]["content"][0]["text"])
     assert cat["available"] is True
-    assert {m["name"] for m in cat["modules"]} == {"bits", "finance", "math", "parse"}
+    assert {m["name"] for m in cat["modules"]} == {"bits", "finance", "math", "parse", "wire"}
 
 
 def test_mcp_stdlib_catalog() -> None:
     res, payload = _call_tool_payload("ail_stdlib_catalog", {"include_source": False})
     assert res["isError"] is False
     assert payload["available"] is True
-    assert payload["module_count"] == 4
+    assert payload["module_count"] == 5
     by_name = {m["name"]: m for m in payload["modules"]}
-    assert set(by_name.keys()) == {"bits", "finance", "math", "parse"}
+    assert set(by_name.keys()) == {"bits", "finance", "math", "parse", "wire"}
     assert "midpoint_u64" in {f["name"] for f in by_name["math"]["functions"]}
     assert "Quote2Way" in {s["name"] for s in by_name["finance"]["structs"]}
     assert "has_ail_magic" in {f["name"] for f in by_name["parse"]["functions"]}
     assert "pack_u32_pair" in {f["name"] for f in by_name["bits"]["functions"]}
+    assert "write_ail_magic" in {f["name"] for f in by_name["wire"]["functions"]}
 
     res_f, fin_payload = _call_tool_payload(
         "ail_stdlib_catalog",
@@ -402,7 +404,7 @@ def _validate_plugin_bundle(plugin_dir: Path) -> dict:
     assert not unknown_keys, f"Unsupported plugin.json fields: {unknown_keys}"
     assert manifest["name"] == "ailang"
     assert manifest["displayName"] == "AIL Verified Kernel Compiler"
-    assert manifest["version"] == "1.0.0"
+    assert manifest["version"] == "1.1.0"
     assert manifest["repository"] == "https://github.com/tachyon-ops/ailang"
     assert manifest["logo"] == "assets/logo.svg"
     assert isinstance(manifest["description"], str) and len(manifest["description"]) > 20

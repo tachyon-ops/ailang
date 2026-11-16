@@ -292,17 +292,20 @@ def apply_deterministic_repair(forms: list[SNode], diag: pb.Diagnostic) -> tuple
                             ],
                             n.span,
                         )
-                    if nop == "*" and isinstance(den.val, int) and den.val > 0:
-                        c = _mk(den.val)
-                        summary_box[0] = f"Decomposed `{pretty(n)}` via quotient-remainder identity"
-                        return _mk(
-                            [
-                                _mk("+"),
-                                _mk([_mk("*"), _mk([_mk("/"), _clone(a), _clone(c)]), _clone(b)]),
-                                _mk([_mk("/"), _mk([_mk("*"), _mk([_mk("%"), _clone(a), _clone(c)]), _clone(b)]), _clone(c)]),
-                            ],
-                            n.span,
-                        )
+                    if nop == "*":
+                        if isinstance(den.val, int) and den.val > 0:
+                            c = _mk(den.val)
+                            summary_box[0] = f"Decomposed `{pretty(n)}` via quotient-remainder identity"
+                            return _mk(
+                                [
+                                    _mk("+"),
+                                    _mk([_mk("*"), _mk([_mk("/"), _clone(a), _clone(c)]), _clone(b)]),
+                                    _mk([_mk("/"), _mk([_mk("*"), _mk([_mk("%"), _clone(a), _clone(c)]), _clone(b)]), _clone(c)]),
+                                ],
+                                n.span,
+                            )
+                        summary_box[0] = f"Rewrote `{pretty(n)}` to widening 128-bit `mul_div_u64`"
+                        return _mk([_mk("mul_div_u64"), _clone(a), _clone(b), _clone(den)], n.span)
 
             if pretty(n) != diag.expr:
                 return None

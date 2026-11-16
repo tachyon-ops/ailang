@@ -13,13 +13,16 @@ from ailang.intervals import Interval, eval_interval
 from ailang.ownership import EnumDef, LINEAR_CAPS, ModuleTypeEnv, StructDef, check_module_ownership_v2
 from ailang.parser import SNode, pretty
 
-Z3Value = z3.ExprRef | dict[str, z3.ArithRef]
+Z3Value = z3.ExprRef | dict[str, Any]
 
 BYTES_SORT = z3.DeclareSort("Bytes")
 Z3_BYTE_AT = z3.Function("ail_byte_at", BYTES_SORT, z3.IntSort(), z3.IntSort())
 Z3_READ_U16_BE = z3.Function("ail_read_u16_be", BYTES_SORT, z3.IntSort(), z3.IntSort())
 Z3_READ_U32_BE = z3.Function("ail_read_u32_be", BYTES_SORT, z3.IntSort(), z3.IntSort())
 Z3_READ_U64_BE = z3.Function("ail_read_u64_be", BYTES_SORT, z3.IntSort(), z3.IntSort())
+Z3_READ_U16_LE = z3.Function("ail_read_u16_le", BYTES_SORT, z3.IntSort(), z3.IntSort())
+Z3_READ_U32_LE = z3.Function("ail_read_u32_le", BYTES_SORT, z3.IntSort(), z3.IntSort())
+Z3_READ_U64_LE = z3.Function("ail_read_u64_le", BYTES_SORT, z3.IntSort(), z3.IntSort())
 Z3_BYTES_EQ4 = z3.Function(
     "ail_bytes_eq4",
     BYTES_SORT,
@@ -36,7 +39,20 @@ BYTES_OP_SPECS: dict[str, tuple[int, int, z3.FuncDeclRef]] = {
     "read_u16_be": (2, 65535, Z3_READ_U16_BE),
     "read_u32_be": (4, 4294967295, Z3_READ_U32_BE),
     "read_u64_be": (8, U64_MAX, Z3_READ_U64_BE),
+    "read_u16_le": (2, 65535, Z3_READ_U16_LE),
+    "read_u32_le": (4, 4294967295, Z3_READ_U32_LE),
+    "read_u64_le": (8, U64_MAX, Z3_READ_U64_LE),
     "bytes_eq4": (4, 1, Z3_BYTES_EQ4),
+}
+
+BYTES_WRITE_SPECS: dict[str, tuple[int, int]] = {
+    "write_byte": (1, 255),
+    "write_u16_be": (2, 65535),
+    "write_u16_le": (2, 65535),
+    "write_u32_be": (4, 4294967295),
+    "write_u32_le": (4, 4294967295),
+    "write_u64_be": (8, U64_MAX),
+    "write_u64_le": (8, U64_MAX),
 }
 
 
@@ -111,16 +127,30 @@ def _z3_trunc_rem(a: z3.ArithRef, b: z3.ArithRef) -> z3.ArithRef:
     return a - b * _z3_trunc_div(a, b)
 
 
-def _z3_dict_eq(d1: dict[str, z3.ArithRef], d2: dict[str, z3.ArithRef]) -> z3.BoolRef:
+def _z3_ite_val(cond: z3.BoolRef, t_val: Any, f_val: Any) -> Any:
+    if isinstance(t_val, str):
+        return t_val
+    if isinstance(t_val, dict) and isinstance(f_val, dict):
+        return {k: _z3_ite_val(cond, t_val[k], f_val[k]) for k in t_val}
+    return z3.If(cond, t_val, f_val)
+
+
+def _z3_val_eq(v1: Any, v2: Any) -> z3.BoolRef:
+    if isinstance(v1, dict) and isinstance(v2, dict):
+        return _z3_dict_eq(v1, v2)
+    return v1 == v2
+
+
+def _z3_dict_eq(d1: dict[str, Any], d2: dict[str, Any]) -> z3.BoolRef:
     if "__tag__" in d1:
         tag1, tag2 = d1["__tag__"], d2["__tag__"]
         eqs: list[z3.BoolRef] = [tag1 == tag2]
         for k in d1:
-            if k != "__tag__":
+            if k not in ("__tag__", "__enum__"):
                 t_idx = int(k.split(":", 1)[0])
-                eqs.append(z3.Implies(tag1 == t_idx, d1[k] == d2[k]))
+                eqs.append(z3.Implies(tag1 == t_idx, _z3_val_eq(d1[k], d2[k])))
         return z3.And(*eqs)
-    return z3.And(*[d1[k] == d2[k] for k in d1])
+    return z3.And(*[_z3_val_eq(d1[k], d2[k]) for k in d1])
 
 
 class ModuleVerifier:
@@ -136,6 +166,125 @@ class ModuleVerifier:
     def fresh_int(self, prefix: str) -> z3.ArithRef:
         self.wit_id += 1
         return z3.Int(f"{prefix}_{self.wit_id}")
+
+    def _z3_zero_for_kind(self, kind: str) -> Z3Value:
+        if kind in ("u64", "i64"):
+            return z3.IntVal(0)
+        assert self.tenv is not None
+        if kind.startswith("struct:"):
+            sdef = self.tenv.structs[kind.split(":", 1)[1]]
+            return {fd.name: self._z3_zero_for_kind(fd.kind) for fd in sdef.fields}
+        if kind.startswith("enum:"):
+            ename = kind.split(":", 1)[1]
+            edef = self.tenv.enums[ename]
+            edict: dict[str, Any] = {"__enum__": ename, "__tag__": z3.IntVal(0)}
+            for v in edef.variants:
+                for i, fd in enumerate(v.fields):
+                    edict[f"{v.tag}:{v.name}.{i}"] = self._z3_zero_for_kind(fd.kind)
+            return edict
+        return z3.IntVal(0)
+
+    def make_symbolic_value(
+        self,
+        prefix: str,
+        kind: str,
+        constraints_out: list[z3.BoolRef],
+        z3_scope: dict[str, Z3Value],
+        scalar_vars_out: dict[str, z3.ArithRef] | None = None,
+        *,
+        type_node: SNode | None = None,
+        fresh_sym: bool = False,
+        guard_cond: z3.BoolRef | None = None,
+        iv_env_out: dict[str, Interval] | None = None,
+        iv_prefix: str = "",
+        iv_scope: dict[str, Interval] | None = None,
+    ) -> Z3Value:
+        assert self.tenv is not None
+
+        def add_guarded(cond: z3.BoolRef) -> None:
+            constraints_out.append(z3.Implies(guard_cond, cond) if guard_cond is not None else cond)
+
+        if kind in ("u64", "i64"):
+            sym = self.fresh_int(prefix) if fresh_sym else z3.Int(prefix)
+            hw_lo, hw_hi = (I64_MIN, I64_MAX) if kind == "i64" else (0, U64_MAX)
+            constraints_out.extend([sym >= hw_lo, sym <= hw_hi])
+            if type_node is not None:
+                lo_n, hi_n = _extract_range_nodes(type_node)
+                lo_v = self.eval_pure_spec(lo_n, z3_scope)
+                hi_v = self.eval_pure_spec(hi_n, z3_scope)
+                add_guarded(z3.And(sym >= lo_v, sym <= hi_v))
+                if iv_env_out is not None and iv_prefix:
+                    cur_ivs = iv_scope if iv_scope is not None else {}
+                    lo_i = eval_interval(lo_n, cur_ivs, self.fn_ret_ranges).lo
+                    hi_i = eval_interval(hi_n, cur_ivs, self.fn_ret_ranges).hi
+                    iv_env_out[iv_prefix] = Interval(max(hw_lo, lo_i), min(hw_hi, hi_i))
+            if scalar_vars_out is not None:
+                scalar_vars_out[prefix] = sym
+            return sym
+
+        if kind.startswith("struct:"):
+            sname = kind.split(":", 1)[1]
+            sdef = self.tenv.structs[sname]
+            fdict: dict[str, Any] = {}
+            local_z3 = dict(z3_scope)
+            local_iv = dict(iv_scope) if iv_scope is not None else {}
+            for fd in sdef.fields:
+                f_iv_key = f"{iv_prefix}__field__{fd.name}" if iv_prefix else ""
+                fv = self.make_symbolic_value(
+                    f"{prefix}.{fd.name}",
+                    fd.kind,
+                    constraints_out,
+                    local_z3,
+                    scalar_vars_out,
+                    type_node=fd.type_node,
+                    fresh_sym=fresh_sym,
+                    guard_cond=guard_cond,
+                    iv_env_out=iv_env_out,
+                    iv_prefix=f_iv_key,
+                    iv_scope=local_iv,
+                )
+                fdict[fd.name] = fv
+                local_z3[fd.name] = fv
+                if iv_env_out is not None and f_iv_key in iv_env_out:
+                    local_iv[fd.name] = iv_env_out[f_iv_key]
+            return fdict
+
+        if kind.startswith("enum:"):
+            ename = kind.split(":", 1)[1]
+            edef = self.tenv.enums[ename]
+            edict: dict[str, Any] = {"__enum__": ename}
+            tag_name = f"{prefix}.__tag__"
+            tag_v = self.fresh_int(f"{prefix}_tag") if fresh_sym else z3.Int(tag_name)
+            constraints_out.extend([tag_v >= 0, tag_v < len(edef.variants)])
+            edict["__tag__"] = tag_v
+            if scalar_vars_out is not None:
+                scalar_vars_out[tag_name] = tag_v
+            for vdef in edef.variants:
+                local_z3 = dict(z3_scope)
+                local_iv = dict(iv_scope) if iv_scope is not None else {}
+                v_guard = (tag_v == vdef.tag) if guard_cond is None else z3.And(guard_cond, tag_v == vdef.tag)
+                for fidx, fd in enumerate(vdef.fields):
+                    f_iv_key = f"{iv_prefix}__enum__{vdef.name}__{fidx}" if iv_prefix else ""
+                    fv = self.make_symbolic_value(
+                        f"{prefix}.{vdef.name}.{fd.name}",
+                        fd.kind,
+                        constraints_out,
+                        local_z3,
+                        scalar_vars_out,
+                        type_node=fd.type_node,
+                        fresh_sym=fresh_sym,
+                        guard_cond=v_guard,
+                        iv_env_out=iv_env_out,
+                        iv_prefix=f_iv_key,
+                        iv_scope=local_iv,
+                    )
+                    edict[f"{vdef.tag}:{vdef.name}.{fidx}"] = fv
+                    local_z3[fd.name] = fv
+                    if iv_env_out is not None and f_iv_key in iv_env_out:
+                        local_iv[fd.name] = iv_env_out[f_iv_key]
+            return edict
+
+        return self.fresh_int(prefix) if fresh_sym else z3.Int(prefix)
 
     def _apply_bytes_uf(self, op: str, buf_sym: Any, idx_v: z3.ArithRef, items: list[SNode]) -> z3.ArithRef:
         _, max_val, uf = BYTES_OP_SPECS[op]
@@ -173,9 +322,7 @@ class ModuleVerifier:
             c = self.eval_pure_spec(items[1], z3_env)
             t = self.eval_pure_spec(items[2], z3_env)
             f = self.eval_pure_spec(items[3], z3_env)
-            if isinstance(t, dict) and isinstance(f, dict):
-                return {k: z3.If(c, t[k], f[k]) for k in t}
-            return z3.If(c, t, f)
+            return _z3_ite_val(c, t, f)
         if op in ("to_i64", "to_u64"):
             return self.eval_pure_spec(items[1], z3_env)
         if op == "make":
@@ -195,30 +342,28 @@ class ModuleVerifier:
             edef = self.tenv.enums[ename]
             vdef = edef.get_variant(vname)
             assert vdef is not None
-            edict: dict[str, z3.ArithRef] = {"__tag__": z3.IntVal(vdef.tag)}
+            edict: dict[str, Any] = {"__enum__": ename, "__tag__": z3.IntVal(vdef.tag)}
             for v in edef.variants:
-                for i in range(len(v.fields)):
-                    edict[f"{v.tag}:{v.name}.{i}"] = z3.IntVal(0)
+                for i, fd in enumerate(v.fields):
+                    edict[f"{v.tag}:{v.name}.{i}"] = self._z3_zero_for_kind(fd.kind)
             for i, arg in enumerate(items[3:]):
-                av = self.eval_pure_spec(arg, z3_env)
-                assert isinstance(av, z3.ArithRef)
-                edict[f"{vdef.tag}:{vdef.name}.{i}"] = av
+                edict[f"{vdef.tag}:{vdef.name}.{i}"] = self.eval_pure_spec(arg, z3_env)
             return edict
         if op == "is_variant":
-            ename = self._node_kind(items[1]).split(":", 1)[1]
+            sv = self.eval_pure_spec(items[1], z3_env)
+            assert isinstance(sv, dict)
+            ename = sv.get("__enum__") or self._node_kind(items[1]).split(":", 1)[1]
             vname = str(items[2].val)
             assert self.tenv is not None and ename in self.tenv.enums
             vdef = self.tenv.enums[ename].get_variant(vname)
             assert vdef is not None
-            sv = self.eval_pure_spec(items[1], z3_env)
-            assert isinstance(sv, dict)
             return sv["__tag__"] == vdef.tag
         if op == "match":
             scrut_n = items[1]
             sv = self.eval_pure_spec(scrut_n, z3_env)
             assert isinstance(sv, dict)
             tag_e = sv["__tag__"]
-            ename = self._node_kind(scrut_n).split(":", 1)[1]
+            ename = sv.get("__enum__") or self._node_kind(scrut_n).split(":", 1)[1]
             assert self.tenv is not None and ename in self.tenv.enums
             edef = self.tenv.enums[ename]
             seen_tags: list[int] = []
@@ -239,10 +384,7 @@ class ModuleVerifier:
                 arm_pairs.append((arm_cond, self.eval_pure_spec(arm_body, arm_env)))
             res_val = arm_pairs[-1][1]
             for ac, av in reversed(arm_pairs[:-1]):
-                if isinstance(res_val, dict) and isinstance(av, dict):
-                    res_val = {k: z3.If(ac, av[k], res_val[k]) for k in res_val}
-                else:
-                    res_val = z3.If(ac, av, res_val)
+                res_val = _z3_ite_val(ac, av, res_val)
             return res_val
         if op in self.specs:
             sp = self.specs[op]
@@ -261,6 +403,8 @@ class ModuleVerifier:
             "%",
             "trunc_div",
             "trunc_rem",
+            "mul_div_u64",
+            "mul_div_ceil_u64",
             ">>",
             "min",
             "max",
@@ -283,6 +427,10 @@ class ModuleVerifier:
             return args[0] - args[1]
         if op == "*":
             return args[0] * args[1]
+        if op == "mul_div_u64":
+            return (args[0] * args[1]) / args[2]
+        if op == "mul_div_ceil_u64":
+            return z3.If(z3.Or(args[0] == 0, args[1] == 0), z3.IntVal(0), ((args[0] * args[1] - 1) / args[2]) + 1)
         if op == "/":
             if self.tenv and self.tenv.expr_types.get(id(node)) == "i64":
                 return _z3_trunc_div(args[0], args[1])
@@ -401,7 +549,7 @@ class ModuleVerifier:
                     eval_interval(ehi_n, iv_env, self.fn_ret_ranges).hi,
                 )
                 param_contracts.append((pname, pk, elo_n, ehi_n))
-            elif pk == "bytes":
+            elif pk in ("bytes", "mut_bytes"):
                 len_var = str(pspec.val[1].val)
                 len_z3 = z3_env[len_var]
                 assert isinstance(len_z3, z3.ArithRef)
@@ -411,63 +559,18 @@ class ModuleVerifier:
                 param_contracts.append((pname, pk, SNode(0, p.span), SNode("MAX", p.span)))
             elif pk == "atomic_u64":
                 param_contracts.append((pname, pk, SNode(0, p.span), SNode("MAX", p.span)))
-            elif pk.startswith("struct:"):
-                sname = pk.split(":", 1)[1]
-                sdef = self.tenv.structs[sname]
-                fdict: dict[str, z3.ArithRef] = {}
-                local_f_env = dict(z3_env)
-                local_iv_env = dict(iv_env)
-                for fd in sdef.fields:
-                    fv = z3.Int(f"{pname}.{fd.name}")
-                    flo_n, fhi_n = _extract_range_nodes(fd.type_node)
-                    hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
-                    flo_v = self.eval_pure_spec(flo_n, local_f_env)
-                    fhi_v = self.eval_pure_spec(fhi_n, local_f_env)
-                    assumptions.extend([fv >= hw_lo, fv <= hw_hi, fv >= flo_v, fv <= fhi_v])
-                    fdict[fd.name] = fv
-                    local_f_env[fd.name] = fv
-                    scalar_vars_for_ce[f"{pname}.{fd.name}"] = fv
-                    fiv = Interval(
-                        eval_interval(flo_n, local_iv_env, self.fn_ret_ranges).lo,
-                        eval_interval(fhi_n, local_iv_env, self.fn_ret_ranges).hi,
-                    )
-                    local_iv_env[fd.name] = fiv
-                    iv_env[f"{pname}__field__{fd.name}"] = fiv
-                z3_env[pname] = fdict
-                param_contracts.append((pname, pk, SNode(0, p.span), SNode(0, p.span)))
-            elif pk.startswith("enum:"):
-                ename = pk.split(":", 1)[1]
-                edef = self.tenv.enums[ename]
-                edict: dict[str, z3.ArithRef] = {}
-                tag_v = z3.Int(f"{pname}.__tag__")
-                assumptions.extend([tag_v >= 0, tag_v < len(edef.variants)])
-                edict["__tag__"] = tag_v
-                scalar_vars_for_ce[f"{pname}.__tag__"] = tag_v
-                for vdef in edef.variants:
-                    local_v_env = dict(z3_env)
-                    local_v_iv = dict(iv_env)
-                    for fidx, fd in enumerate(vdef.fields):
-                        fv = z3.Int(f"{pname}.{vdef.name}.{fd.name}")
-                        flo_n, fhi_n = _extract_range_nodes(fd.type_node)
-                        hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
-                        flo_v = self.eval_pure_spec(flo_n, local_v_env)
-                        fhi_v = self.eval_pure_spec(fhi_n, local_v_env)
-                        assumptions.extend(
-                            [
-                                fv >= hw_lo,
-                                fv <= hw_hi,
-                                z3.Implies(tag_v == vdef.tag, z3.And(fv >= flo_v, fv <= fhi_v)),
-                            ]
-                        )
-                        edict[f"{vdef.tag}:{vdef.name}.{fidx}"] = fv
-                        local_v_env[fd.name] = fv
-                        scalar_vars_for_ce[f"{pname}.{vdef.name}.{fd.name}"] = fv
-                        fiv_lo = eval_interval(flo_n, local_v_iv, self.fn_ret_ranges).lo
-                        fiv_hi = eval_interval(fhi_n, local_v_iv, self.fn_ret_ranges).hi
-                        fiv = Interval(max(hw_lo, fiv_lo), min(hw_hi, fiv_hi))
-                        local_v_iv[fd.name] = fiv
-                        iv_env[f"{pname}__enum__{vdef.name}__{fidx}"] = fiv
-                z3_env[pname] = edict
+            elif pk.startswith(("struct:", "enum:")):
+                z3_env[pname] = self.make_symbolic_value(
+                    pname,
+                    pk,
+                    assumptions,
+                    z3_env,
+                    scalar_vars_for_ce,
+                    fresh_sym=False,
+                    iv_env_out=iv_env,
+                    iv_prefix=pname,
+                    iv_scope=iv_env,
+                )
                 param_contracts.append((pname, pk, SNode(0, p.span), SNode(0, p.span)))
             else:
                 lo_n, hi_n = _extract_range_nodes(pspec)
@@ -527,6 +630,8 @@ class ModuleVerifier:
                             for vdef in edef.variants:
                                 l_iv = dict(niv)
                                 for fidx, fd in enumerate(vdef.fields):
+                                    if fd.kind not in ("u64", "i64"):
+                                        continue
                                     flo_n, fhi_n = _extract_range_nodes(fd.type_node)
                                     hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
                                     fiv = Interval(
@@ -547,9 +652,7 @@ class ModuleVerifier:
                 assert isinstance(c, z3.BoolRef)
                 tv = eval_checked(sub[2], cur_z3, cur_iv, cur_extra, z3.And(guard, c))
                 fv = eval_checked(sub[3], cur_z3, cur_iv, cur_extra, z3.And(guard, z3.Not(c)))
-                if isinstance(tv, dict) and isinstance(fv, dict):
-                    return {k: z3.If(c, tv[k], fv[k]) for k in tv}
-                return z3.If(c, tv, fv)
+                return _z3_ite_val(c, tv, fv)
 
             if op == "to_i64":
                 av = eval_checked(sub[1], cur_z3, cur_iv, cur_extra, guard)
@@ -574,24 +677,25 @@ class ModuleVerifier:
             if op == "make":
                 sname = str(sub[1].val)
                 sdef = self.tenv.structs[sname]
-                built: dict[str, z3.ArithRef] = {}
+                built: dict[str, Any] = {}
                 field_scope = dict(cur_z3)
                 for fd, arg_n in zip(sdef.fields, sub[2:]):
                     fv = eval_checked(arg_n, cur_z3, cur_iv, cur_extra, guard)
-                    assert isinstance(fv, z3.ArithRef)
-                    flo_n, fhi_n = _extract_range_nodes(fd.type_node)
-                    flo_v = self.eval_pure_spec(flo_n, field_scope)
-                    fhi_v = self.eval_pure_spec(fhi_n, field_scope)
-                    check_z3(
-                        pb.E_STRUCT_INVARIANT_FAILED,
-                        arg_n.span,
-                        pretty(n),
-                        f"Struct `{sname}` field `{fd.name}` violates dependent refinement `{pretty(fd.type_node)}`",
-                        guard,
-                        z3.And(fv >= flo_v, fv <= fhi_v),
-                        cur_z3,
-                        cur_extra,
-                    )
+                    if fd.kind in ("u64", "i64"):
+                        assert isinstance(fv, z3.ArithRef)
+                        flo_n, fhi_n = _extract_range_nodes(fd.type_node)
+                        flo_v = self.eval_pure_spec(flo_n, field_scope)
+                        fhi_v = self.eval_pure_spec(fhi_n, field_scope)
+                        check_z3(
+                            pb.E_STRUCT_INVARIANT_FAILED,
+                            arg_n.span,
+                            pretty(n),
+                            f"Struct `{sname}` field `{fd.name}` violates dependent refinement `{pretty(fd.type_node)}`",
+                            guard,
+                            z3.And(fv >= flo_v, fv <= fhi_v),
+                            cur_z3,
+                            cur_extra,
+                        )
                     built[fd.name] = fv
                     field_scope[fd.name] = fv
                 return built
@@ -607,27 +711,28 @@ class ModuleVerifier:
                 edef = self.tenv.enums[ename]
                 vdef = edef.get_variant(vname)
                 assert vdef is not None
-                built_e: dict[str, z3.ArithRef] = {"__tag__": z3.IntVal(vdef.tag)}
+                built_e: dict[str, Any] = {"__enum__": ename, "__tag__": z3.IntVal(vdef.tag)}
                 for v in edef.variants:
-                    for i in range(len(v.fields)):
-                        built_e[f"{v.tag}:{v.name}.{i}"] = z3.IntVal(0)
+                    for i, fd in enumerate(v.fields):
+                        built_e[f"{v.tag}:{v.name}.{i}"] = self._z3_zero_for_kind(fd.kind)
                 fscope = dict(cur_z3)
                 for i, (fd, arg_n) in enumerate(zip(vdef.fields, sub[3:])):
                     fv = eval_checked(arg_n, cur_z3, cur_iv, cur_extra, guard)
-                    assert isinstance(fv, z3.ArithRef)
-                    flo_n, fhi_n = _extract_range_nodes(fd.type_node)
-                    flo_v = self.eval_pure_spec(flo_n, fscope)
-                    fhi_v = self.eval_pure_spec(fhi_n, fscope)
-                    check_z3(
-                        pb.E_ENUM_INVARIANT_FAILED,
-                        arg_n.span,
-                        pretty(n),
-                        f"Enum `{ename}.{vname}` field `{fd.name}` violates dependent refinement `{pretty(fd.type_node)}`",
-                        guard,
-                        z3.And(fv >= flo_v, fv <= fhi_v),
-                        cur_z3,
-                        cur_extra,
-                    )
+                    if fd.kind in ("u64", "i64"):
+                        assert isinstance(fv, z3.ArithRef)
+                        flo_n, fhi_n = _extract_range_nodes(fd.type_node)
+                        flo_v = self.eval_pure_spec(flo_n, fscope)
+                        fhi_v = self.eval_pure_spec(fhi_n, fscope)
+                        check_z3(
+                            pb.E_ENUM_INVARIANT_FAILED,
+                            arg_n.span,
+                            pretty(n),
+                            f"Enum `{ename}.{vname}` field `{fd.name}` violates dependent refinement `{pretty(fd.type_node)}`",
+                            guard,
+                            z3.And(fv >= flo_v, fv <= fhi_v),
+                            cur_z3,
+                            cur_extra,
+                        )
                     built_e[f"{vdef.tag}:{vdef.name}.{i}"] = fv
                     fscope[fd.name] = fv
                 return built_e
@@ -635,7 +740,7 @@ class ModuleVerifier:
             if op == "is_variant":
                 sv = eval_checked(sub[1], cur_z3, cur_iv, cur_extra, guard)
                 assert isinstance(sv, dict)
-                ename = self._node_kind(sub[1]).split(":", 1)[1]
+                ename = sv.get("__enum__") or self._node_kind(sub[1]).split(":", 1)[1]
                 vdef = self.tenv.enums[ename].get_variant(str(sub[2].val))
                 assert vdef is not None
                 return sv["__tag__"] == vdef.tag
@@ -645,7 +750,7 @@ class ModuleVerifier:
                 sv = eval_checked(scrut_n, cur_z3, cur_iv, cur_extra, guard)
                 assert isinstance(sv, dict)
                 tag_e = sv["__tag__"]
-                ename = self._node_kind(scrut_n).split(":", 1)[1]
+                ename = sv.get("__enum__") or self._node_kind(scrut_n).split(":", 1)[1]
                 edef = self.tenv.enums[ename]
                 seen_tags: list[int] = []
                 arm_pairs: list[tuple[z3.BoolRef, Z3Value]] = []
@@ -666,26 +771,24 @@ class ModuleVerifier:
                         for fidx, (bnode, fd) in enumerate(zip(pat.val[1:], vdef.fields)):
                             bname = str(bnode.val)
                             arm_z3[bname] = sv[f"{vdef.tag}:{vdef.name}.{fidx}"]
-                            iv_key = f"{scrut_name}__enum__{vdef.name}__{fidx}" if scrut_name else ""
-                            if iv_key and iv_key in cur_iv:
-                                fiv = cur_iv[iv_key]
-                            else:
-                                flo_n, fhi_n = _extract_range_nodes(fd.type_node)
-                                hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
-                                fiv = Interval(
-                                    max(hw_lo, eval_interval(flo_n, arm_iv, self.fn_ret_ranges).lo),
-                                    min(hw_hi, eval_interval(fhi_n, arm_iv, self.fn_ret_ranges).hi),
-                                )
-                            arm_iv[bname] = fiv
+                            if fd.kind in ("u64", "i64"):
+                                iv_key = f"{scrut_name}__enum__{vdef.name}__{fidx}" if scrut_name else ""
+                                if iv_key and iv_key in cur_iv:
+                                    fiv = cur_iv[iv_key]
+                                else:
+                                    flo_n, fhi_n = _extract_range_nodes(fd.type_node)
+                                    hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
+                                    fiv = Interval(
+                                        max(hw_lo, eval_interval(flo_n, arm_iv, self.fn_ret_ranges).lo),
+                                        min(hw_hi, eval_interval(fhi_n, arm_iv, self.fn_ret_ranges).hi),
+                                    )
+                                arm_iv[bname] = fiv
                     arm_val = eval_checked(arm_body, arm_z3, arm_iv, cur_extra, z3.And(guard, arm_cond))
                     arm_pairs.append((arm_cond, arm_val))
 
                 res_val = arm_pairs[-1][1]
                 for ac, av in reversed(arm_pairs[:-1]):
-                    if isinstance(res_val, dict) and isinstance(av, dict):
-                        res_val = {k: z3.If(ac, av[k], res_val[k]) for k in res_val}
-                    else:
-                        res_val = z3.If(ac, av, res_val)
+                    res_val = _z3_ite_val(ac, av, res_val)
                 return res_val
 
             if op in ("io.print_u64", "io.print_i64", "fs.write_u64", "fs.write_i64"):
@@ -751,6 +854,40 @@ class ModuleVerifier:
                     cur_extra,
                 )
                 return self._apply_bytes_uf(op, cur_z3[buf_name], idx_v, sub)
+
+            if op in BYTES_WRITE_SPECS:
+                buf_name = str(sub[1].val)
+                idx_v = eval_checked(sub[2], cur_z3, cur_iv, cur_extra, guard)
+                val_v = eval_checked(sub[3], cur_z3, cur_iv, cur_extra, guard)
+                assert isinstance(idx_v, z3.ArithRef) and isinstance(val_v, z3.ArithRef)
+                len_var, len_v = bytes_lengths[buf_name]
+                width, max_val = BYTES_WRITE_SPECS[op]
+                check_z3(
+                    pb.E_OUT_OF_BOUNDS,
+                    n.span,
+                    pretty(n),
+                    f"`{op}` write at `{pretty(sub[2])}` (+{width} bytes) may exceed `{buf_name}` length `{len_var}`",
+                    guard,
+                    z3.And(idx_v >= 0, idx_v + width <= len_v),
+                    cur_z3,
+                    cur_extra,
+                )
+                if max_val < U64_MAX:
+                    val_iv = eval_interval(sub[3], cur_iv, self.fn_ret_ranges)
+                    if 0 <= val_iv.lo and val_iv.hi <= max_val:
+                        stats.tier0_interval_discharged += 1
+                    else:
+                        check_z3(
+                            pb.E_PRECONDITION_FAILED,
+                            sub[3].span,
+                            pretty(n),
+                            f"`{op}` value `{pretty(sub[3])}` may exceed `[0..{max_val}]`",
+                            guard,
+                            z3.And(val_v >= 0, val_v <= max_val),
+                            cur_z3,
+                            cur_extra,
+                        )
+                return z3.IntVal(width)
 
             if op == "fold":
                 stats.o1_loop_steps += 1
@@ -833,7 +970,7 @@ class ModuleVerifier:
                 for (pname, pkind, plo_n, phi_n), arg_node in zip(fc.params, sub[2:]):
                     if pkind in ("slice", "mut_slice", "atomic_u64") or pkind in LINEAR_CAPS:
                         continue
-                    if pkind == "bytes":
+                    if pkind in ("bytes", "mut_bytes"):
                         arg_buf_name = str(arg_node.val)
                         actual_len_var, actual_len_v = bytes_lengths[arg_buf_name]
                         callee_len_var = fc.bytes_len_params[pname]
@@ -867,51 +1004,19 @@ class ModuleVerifier:
                             cur_z3,
                             cur_extra,
                         )
-                if fc.ret_kind.startswith("struct:"):
-                    sname = fc.ret_kind.split(":", 1)[1]
-                    sdef = self.tenv.structs[sname]
-                    rdict: dict[str, z3.ArithRef] = {}
-                    fscope = dict(callee_env)
-                    for fd in sdef.fields:
-                        fv = self.fresh_int(f"_{callee}_{fd.name}")
-                        flo_n, fhi_n = _extract_range_nodes(fd.type_node)
-                        hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
-                        axioms.extend([fv >= hw_lo, fv <= hw_hi, fv >= self.eval_pure_spec(flo_n, fscope), fv <= self.eval_pure_spec(fhi_n, fscope)])
-                        rdict[fd.name] = fv
-                        fscope[fd.name] = fv
+                if fc.ret_kind.startswith(("struct:", "enum:")):
+                    rdict = self.make_symbolic_value(
+                        f"_{callee}_ret",
+                        fc.ret_kind,
+                        axioms,
+                        callee_env,
+                        None,
+                        fresh_sym=True,
+                    )
                     callee_env[fc.ret_name] = rdict
                     for ens in fc.ensures:
                         axioms.append(self.eval_pure_spec(ens, callee_env))
                     return rdict
-                if fc.ret_kind.startswith("enum:"):
-                    ename = fc.ret_kind.split(":", 1)[1]
-                    edef = self.tenv.enums[ename]
-                    erdict: dict[str, z3.ArithRef] = {}
-                    tag_r = self.fresh_int(f"_{callee}_tag")
-                    axioms.extend([tag_r >= 0, tag_r < len(edef.variants)])
-                    erdict["__tag__"] = tag_r
-                    for vdef in edef.variants:
-                        fscope = dict(callee_env)
-                        for fidx, fd in enumerate(vdef.fields):
-                            fv = self.fresh_int(f"_{callee}_{vdef.name}_{fd.name}")
-                            flo_n, fhi_n = _extract_range_nodes(fd.type_node)
-                            hw_lo, hw_hi = (I64_MIN, I64_MAX) if fd.kind == "i64" else (0, U64_MAX)
-                            axioms.extend(
-                                [
-                                    fv >= hw_lo,
-                                    fv <= hw_hi,
-                                    z3.Implies(
-                                        tag_r == vdef.tag,
-                                        z3.And(fv >= self.eval_pure_spec(flo_n, fscope), fv <= self.eval_pure_spec(fhi_n, fscope)),
-                                    ),
-                                ]
-                            )
-                            erdict[f"{vdef.tag}:{vdef.name}.{fidx}"] = fv
-                            fscope[fd.name] = fv
-                    callee_env[fc.ret_name] = erdict
-                    for ens in fc.ensures:
-                        axioms.append(self.eval_pure_spec(ens, callee_env))
-                    return erdict
 
                 call_ret = self.fresh_int(f"_{callee}_ret")
                 callee_env[fc.ret_name] = call_ret
@@ -1028,6 +1133,40 @@ class ModuleVerifier:
                 return z3.If(args[0] <= args[1], args[0], args[1])
             if op == "max":
                 return z3.If(args[0] >= args[1], args[0], args[1])
+            if op in ("mul_div_u64", "mul_div_ceil_u64"):
+                a_v, b_v, d_v = args[0], args[1], args[2]
+                d_iv = eval_interval(sub[3], cur_iv, self.fn_ret_ranges)
+                if d_iv.lo > 0:
+                    stats.tier0_interval_discharged += 1
+                else:
+                    check_z3(
+                        pb.E_DIV_BY_ZERO,
+                        sub[3].span,
+                        pretty(n),
+                        f"`{op}` divisor `{pretty(sub[3])}` may be zero",
+                        guard,
+                        d_v > 0,
+                        cur_z3,
+                        cur_extra,
+                    )
+                if op == "mul_div_u64":
+                    res = (a_v * b_v) / d_v
+                else:
+                    res = z3.If(z3.Or(a_v == 0, b_v == 0), z3.IntVal(0), ((a_v * b_v - 1) / d_v) + 1)
+                if iv.lo >= 0 and iv.hi <= U64_MAX:
+                    stats.tier0_interval_discharged += 1
+                else:
+                    check_z3(
+                        pb.E_U64_OVERFLOW,
+                        n.span,
+                        pretty(n),
+                        f"64-bit unsigned `{op}` quotient exceeds U64_MAX",
+                        guard,
+                        z3.And(res >= 0, res <= U64_MAX),
+                        cur_z3,
+                        cur_extra,
+                    )
+                return res
             if op in ("==", "!=", "<", "<=", ">", ">="):
                 if op in ("==", "!=") and isinstance(args[0], dict) and isinstance(args[1], dict):
                     eq_ref = _z3_dict_eq(args[0], args[1])

@@ -1,0 +1,59 @@
+; AIL v1.1 Showcase: Type Aliases, Nested Struct/Enum, 128-bit Widening Math & Bidirectional Wire Codec
+(import "stdlib/wire")
+(import "stdlib/finance")
+
+(const AIL_V1_MAGIC_VER u64 1)
+
+(type FeeBps u64[0..10000])
+(type NetAmount u64[0..MAX])
+
+(struct PacketMeta
+  ((version u64[1..255])
+   (flags u64[0..255])
+   (seq_le u64[0..4294967295])))
+
+(enum DecodedPacket
+  (PacketOk (meta PacketMeta) (net NetAmount) (fee u64[0..(- MAX net)]))
+  (PacketErr (code u64[1..3])))
+
+(fn encode_v1_1_packet
+  ((n u64[24..MAX])
+   (buf (mut_bytes n))
+   (flags u64[0..255])
+   (seq_le u64[0..4294967295])
+   (amount NetAmount)
+   (bps FeeBps))
+  u64[24..24]
+  (let ((wh (call encode_ail_frame_header n buf AIL_V1_MAGIC_VER flags 16))
+        (ws (write_u32_le buf 8 seq_le))
+        (wa (write_u64_le buf 12 amount))
+        (wb (write_u16_le buf 20 bps))
+        (wt (write_u16_le buf 22 1)))
+    (+ wh (+ ws (+ wa (+ wb wt))))))
+
+(fn decode_v1_1_packet ((n u64[0..MAX]) (buf (bytes n)))
+  DecodedPacket
+  (if (< n 24)
+    (variant DecodedPacket PacketErr 1)
+    (if (== (bytes_eq4 buf 0 65 73 76 49) 0)
+      (variant DecodedPacket PacketErr 2)
+      (let ((ver (byte_at buf 4)))
+        (if (!= ver AIL_V1_MAGIC_VER)
+          (variant DecodedPacket PacketErr 3)
+          (let ((flags (byte_at buf 5))
+                (seq (read_u32_le buf 8))
+                (amount (read_u64_le buf 12))
+                (bps_raw (read_u16_le buf 20))
+                (bps (if (<= bps_raw 10000) bps_raw 10000))
+                (fee (call mul_bps_wide_u64 amount bps))
+                (meta (make PacketMeta ver flags seq)))
+            (variant DecodedPacket PacketOk meta (- amount fee) fee)))))))
+
+(fn packet_total_value ((pkt DecodedPacket))
+  (out u64[0..MAX]
+    (== out (match pkt
+              ((PacketOk m net fee) (+ net fee))
+              ((PacketErr code) 0))))
+  (match pkt
+    ((PacketOk m net fee) (+ net fee))
+    ((PacketErr code) 0)))

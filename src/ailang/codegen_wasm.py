@@ -6,7 +6,15 @@ from pathlib import Path
 from typing import Any
 
 from ailang.diagnostics import I64_MAX, I64_MIN, U64_MAX
-from ailang.ownership import EnumDef, LINEAR_CAPS, FnSig, ModuleTypeEnv, StructDef, check_module_ownership_v2
+from ailang.ownership import (
+    EnumDef,
+    LINEAR_CAPS,
+    FnSig,
+    ModuleTypeEnv,
+    StructDef,
+    check_module_ownership_v2,
+    kind_u64_slots,
+)
 from ailang.parser import SNode
 
 WASM_MAGIC_VERSION = b"\x00asm\x01\x00\x00\x00"
@@ -105,6 +113,9 @@ MEM_LOAD_STORE_OPCODES: dict[str, tuple[int, int]] = {
     "i64.load32_u": (0x35, 2),
     "i32.store": (0x36, 2),
     "i64.store": (0x37, 3),
+    "i64.store8": (0x3C, 0),
+    "i64.store16": (0x3D, 1),
+    "i64.store32": (0x3E, 2),
 }
 
 
@@ -216,9 +227,21 @@ def _len_source_from_spec(pspec: SNode) -> str | int | None:
 def _wasm_valtype_for_kind(kind: str) -> int | None:
     if kind in LINEAR_CAPS or kind == "void":
         return None
-    if kind == "bool" or kind in ("slice", "mut_slice", "bytes", "atomic_u64") or kind.startswith(("struct:", "enum:")):
+    if kind == "bool" or kind in ("slice", "mut_slice", "bytes", "mut_bytes", "atomic_u64") or kind.startswith(("struct:", "enum:")):
         return VAL_I32
     return VAL_I64
+
+
+def _collect_used_mul_div(forms: list[SNode]) -> bool:
+    def walk(node: SNode) -> bool:
+        if not isinstance(node.val, list) or not node.val:
+            return False
+        head = node.val[0].val
+        if isinstance(head, str) and head in ("mul_div_u64", "mul_div_ceil_u64"):
+            return True
+        return any(walk(ch) for ch in node.val)
+
+    return any(walk(f) for f in forms if isinstance(f.val, list) and f.val and str(f.val[0].val) in ("fn", "main", "map_inplace"))
 
 
 def _blocktype_for_valtype(vty: int | None) -> int:
@@ -259,10 +282,12 @@ class _WasmFuncBuilder:
         alloc_fn_idx: int,
         param_names: list[str],
         param_types: list[int],
+        mul_div_fn_idx: int | None = None,
     ) -> None:
         self.tenv = tenv
         self.fn_indices = fn_indices
         self.alloc_fn_idx = alloc_fn_idx
+        self.mul_div_fn_idx = mul_div_fn_idx
         self.param_count = len(param_names)
         self.locals_decls: list[tuple[str, int]] = []
         self.instrs: list[tuple[Any, ...]] = []
@@ -308,7 +333,26 @@ class _WasmFuncBuilder:
             sname = self._node_kind(items[1], env).split(":", 1)[1]
             found = self.tenv.structs[sname].get_field(str(items[2].val))
             return found[1].kind if found else "u64"
-        if op in ("byte_at", "read_u16_be", "read_u32_be", "read_u64_be", "bytes_eq4", "get"):
+        if op in (
+            "byte_at",
+            "read_u16_be",
+            "read_u32_be",
+            "read_u64_be",
+            "read_u16_le",
+            "read_u32_le",
+            "read_u64_le",
+            "bytes_eq4",
+            "write_byte",
+            "write_u16_be",
+            "write_u32_be",
+            "write_u64_be",
+            "write_u16_le",
+            "write_u32_le",
+            "write_u64_le",
+            "mul_div_u64",
+            "mul_div_ceil_u64",
+            "get",
+        ):
             return "u64"
         if op == "call":
             return self.tenv.sigs[str(items[1].val)].ret_kind
@@ -399,27 +443,37 @@ class _WasmFuncBuilder:
         if op == "make":
             sname = str(items[1].val)
             sdef = self.tenv.structs[sname]
-            size = max(8, 8 * len(sdef.fields))
+            nslots = kind_u64_slots(f"struct:{sname}", self.tenv.structs, self.tenv.enums)
+            size = max(8, 8 * nslots)
             ptr_loc = self.alloc_local(VAL_I32, f"{sname}_ptr")
             self.emit_op("i32.const", size)
             self.emit_op("call", self.alloc_fn_idx, "__ail_alloc")
             self.emit_op("local.set", ptr_loc, f"{sname}_ptr")
-            for fidx, arg_n in enumerate(items[2:]):
-                self.emit_op("local.get", ptr_loc, f"{sname}_ptr")
-                self.emit_expr(arg_n, env)
-                self.emit_op("i64.store", 3, fidx * 8)
+            byte_off = 0
+            for fd, arg_n in zip(sdef.fields, items[2:]):
+                self._emit_store_field(ptr_loc, byte_off, arg_n, fd.kind, env)
+                byte_off += 8 * kind_u64_slots(fd.kind, self.tenv.structs, self.tenv.enums)
             self.emit_op("local.get", ptr_loc, f"{sname}_ptr")
             return VAL_I32
 
         if op == "field":
             sv_node = items[1]
             sname = self._node_kind(sv_node, env).split(":", 1)[1]
+            sdef = self.tenv.structs[sname]
             fname = str(items[2].val)
-            found = self.tenv.structs[sname].get_field(fname)
+            found = sdef.get_field(fname)
             assert found is not None
-            fidx = found[0]
+            fidx, fd = found
+            byte_off = 8 * sum(
+                kind_u64_slots(sdef.fields[i].kind, self.tenv.structs, self.tenv.enums) for i in range(fidx)
+            )
             self.emit_expr(sv_node, env)
-            self.emit_op("i64.load", 3, fidx * 8)
+            if fd.kind.startswith(("struct:", "enum:")):
+                if byte_off > 0:
+                    self.emit_op("i32.const", byte_off)
+                    self.emit_op("i32.add")
+                return VAL_I32
+            self.emit_op("i64.load", 3, byte_off)
             return VAL_I64
 
         if op == "variant":
@@ -428,7 +482,8 @@ class _WasmFuncBuilder:
             edef = self.tenv.enums[ename]
             vdef = edef.get_variant(vname)
             assert vdef is not None
-            size = 8 * (1 + edef.max_fields)
+            max_slots = edef.max_payload_slots(self.tenv.structs, self.tenv.enums)
+            size = 8 * (1 + max_slots)
             ptr_loc = self.alloc_local(VAL_I32, f"{ename}_ptr")
             self.emit_op("i32.const", size)
             self.emit_op("call", self.alloc_fn_idx, "__ail_alloc")
@@ -436,14 +491,14 @@ class _WasmFuncBuilder:
             self.emit_op("local.get", ptr_loc, f"{ename}_ptr")
             self.emit_op("i64.const", vdef.tag)
             self.emit_op("i64.store", 3, 0)
-            for fidx, arg_n in enumerate(items[3:]):
-                self.emit_op("local.get", ptr_loc, f"{ename}_ptr")
-                self.emit_expr(arg_n, env)
-                self.emit_op("i64.store", 3, (1 + fidx) * 8)
-            for fidx in range(len(items[3:]), edef.max_fields):
+            used_slots = 0
+            for fd, arg_n in zip(vdef.fields, items[3:]):
+                self._emit_store_field(ptr_loc, (1 + used_slots) * 8, arg_n, fd.kind, env)
+                used_slots += kind_u64_slots(fd.kind, self.tenv.structs, self.tenv.enums)
+            for s_idx in range(used_slots, max_slots):
                 self.emit_op("local.get", ptr_loc, f"{ename}_ptr")
                 self.emit_op("i64.const", 0)
-                self.emit_op("i64.store", 3, (1 + fidx) * 8)
+                self.emit_op("i64.store", 3, (1 + s_idx) * 8)
             self.emit_op("local.get", ptr_loc, f"{ename}_ptr")
             return VAL_I32
 
@@ -488,8 +543,33 @@ class _WasmFuncBuilder:
             self.emit_op("i64.load", 3, 0)
             return VAL_I64
 
-        if op in ("byte_at", "read_u16_be", "read_u32_be", "read_u64_be", "bytes_eq4"):
+        if op in (
+            "byte_at",
+            "read_u16_be",
+            "read_u32_be",
+            "read_u64_be",
+            "read_u16_le",
+            "read_u32_le",
+            "read_u64_le",
+            "bytes_eq4",
+            "write_byte",
+            "write_u16_be",
+            "write_u32_be",
+            "write_u64_be",
+            "write_u16_le",
+            "write_u32_le",
+            "write_u64_le",
+        ):
             return self._emit_bytes_op(op, items, env)
+
+        if op in ("mul_div_u64", "mul_div_ceil_u64"):
+            assert self.mul_div_fn_idx is not None
+            self.emit_expr(items[1], env)
+            self.emit_expr(items[2], env)
+            self.emit_expr(items[3], env)
+            self.emit_op("i32.const", 1 if op == "mul_div_ceil_u64" else 0)
+            self.emit_op("call", self.mul_div_fn_idx, "__ail_mul_div_u64")
+            return VAL_I64
 
         if op == "fold":
             return self._emit_fold(items, nk, env)
@@ -526,7 +606,20 @@ class _WasmFuncBuilder:
             return VAL_I32
 
         if op in ("==", "!=", "<", "<=", ">", ">="):
-            cmp_signed = (self._raw_kind(items[1], env) == "i64") or (self._raw_kind(items[2], env) == "i64")
+            rk1 = self._raw_kind(items[1], env)
+            rk2 = self._raw_kind(items[2], env)
+            if rk1.startswith(("struct:", "enum:")) and op in ("==", "!="):
+                pa_loc = self.alloc_local(VAL_I32, "eq_a")
+                pb_loc = self.alloc_local(VAL_I32, "eq_b")
+                self.emit_expr(items[1], env)
+                self.emit_op("local.set", pa_loc, "eq_a")
+                self.emit_expr(items[2], env)
+                self.emit_op("local.set", pb_loc, "eq_b")
+                self._emit_agg_eq_at_ptrs(pa_loc, pb_loc, 0, 0, rk1)
+                if op == "!=":
+                    self.emit_op("i32.eqz")
+                return VAL_I32
+            cmp_signed = (rk1 == "i64") or (rk2 == "i64")
             self.emit_expr(items[1], env)
             self.emit_expr(items[2], env)
             if op == "==":
@@ -634,6 +727,84 @@ class _WasmFuncBuilder:
         self.emit_op("end")
         return res_wty
 
+    def _emit_store_field(
+        self,
+        dst_ptr_loc: int,
+        byte_off: int,
+        arg_node: SNode,
+        kind: str,
+        env: dict[str, tuple[int, int | None, str]],
+    ) -> None:
+        if kind in ("u64", "i64"):
+            self.emit_op("local.get", dst_ptr_loc, "agg_dst")
+            self.emit_expr(arg_node, env)
+            self.emit_op("i64.store", 3, byte_off)
+            return
+        src_loc = self.alloc_local(VAL_I32, "agg_src")
+        self.emit_expr(arg_node, env)
+        self.emit_op("local.set", src_loc, "agg_src")
+        nslots = kind_u64_slots(kind, self.tenv.structs, self.tenv.enums)
+        for sidx in range(nslots):
+            self.emit_op("local.get", dst_ptr_loc, "agg_dst")
+            self.emit_op("local.get", src_loc, "agg_src")
+            self.emit_op("i64.load", 3, sidx * 8)
+            self.emit_op("i64.store", 3, byte_off + sidx * 8)
+
+    def _emit_agg_eq_at_ptrs(
+        self,
+        pa_loc: int,
+        pb_loc: int,
+        off_a: int,
+        off_b: int,
+        kind: str,
+    ) -> None:
+        if kind in ("u64", "i64"):
+            self.emit_op("local.get", pa_loc, "eq_a")
+            self.emit_op("i64.load", 3, off_a)
+            self.emit_op("local.get", pb_loc, "eq_b")
+            self.emit_op("i64.load", 3, off_b)
+            self.emit_op("i64.eq")
+            return
+        if kind.startswith("struct:"):
+            sdef = self.tenv.structs[kind.split(":", 1)[1]]
+            if not sdef.fields:
+                self.emit_op("i32.const", 1)
+                return
+            cur_off = 0
+            for idx, fd in enumerate(sdef.fields):
+                self._emit_agg_eq_at_ptrs(pa_loc, pb_loc, off_a + cur_off, off_b + cur_off, fd.kind)
+                if idx > 0:
+                    self.emit_op("i32.and")
+                cur_off += 8 * kind_u64_slots(fd.kind, self.tenv.structs, self.tenv.enums)
+            return
+        if kind.startswith("enum:"):
+            edef = self.tenv.enums[kind.split(":", 1)[1]]
+            self.emit_op("local.get", pa_loc, "eq_a")
+            self.emit_op("i64.load", 3, off_a)
+            self.emit_op("local.get", pb_loc, "eq_b")
+            self.emit_op("i64.load", 3, off_b)
+            self.emit_op("i64.eq")
+            for vdef in edef.variants:
+                if not vdef.fields:
+                    continue
+                self.emit_op("local.get", pa_loc, "eq_a")
+                self.emit_op("i64.load", 3, off_a)
+                self.emit_op("i64.const", vdef.tag)
+                self.emit_op("i64.eq")
+                self.emit_op("if", BLOCK_I32)
+                cur_off = 8
+                for idx, fd in enumerate(vdef.fields):
+                    self._emit_agg_eq_at_ptrs(pa_loc, pb_loc, off_a + cur_off, off_b + cur_off, fd.kind)
+                    if idx > 0:
+                        self.emit_op("i32.and")
+                    cur_off += 8 * kind_u64_slots(fd.kind, self.tenv.structs, self.tenv.enums)
+                self.emit_op("else")
+                self.emit_op("i32.const", 1)
+                self.emit_op("end")
+                self.emit_op("i32.and")
+            return
+        self.emit_op("i32.const", 1)
+
     def _bind_match_pat(
         self,
         pat: SNode,
@@ -646,13 +817,22 @@ class _WasmFuncBuilder:
             return arm_env
         vdef = edef.get_variant(str(pat.val[0].val))
         assert vdef is not None
-        for fidx, (bnode, fd) in enumerate(zip(pat.val[1:], vdef.fields)):
+        byte_off = 8
+        for bnode, fd in zip(pat.val[1:], vdef.fields):
             bname = str(bnode.val)
-            floc = self.alloc_local(VAL_I64, bname)
+            wty = _wasm_valtype_for_kind(fd.kind)
+            assert wty is not None
+            floc = self.alloc_local(wty, bname)
             self.emit_op("local.get", sptr_loc, "match_scrut")
-            self.emit_op("i64.load", 3, (1 + fidx) * 8)
+            if fd.kind.startswith(("struct:", "enum:")):
+                if byte_off > 0:
+                    self.emit_op("i32.const", byte_off)
+                    self.emit_op("i32.add")
+            else:
+                self.emit_op("i64.load", 3, byte_off)
             self.emit_op("local.set", floc, bname)
-            arm_env[bname] = (floc, VAL_I64, fd.kind)
+            arm_env[bname] = (floc, wty, fd.kind)
+            byte_off += 8 * kind_u64_slots(fd.kind, self.tenv.structs, self.tenv.enums)
         return arm_env
 
     def _emit_bytes_op(
@@ -669,6 +849,50 @@ class _WasmFuncBuilder:
 
         if op == "byte_at":
             self.emit_op("i64.load8_u", 0, 0)
+            return VAL_I64
+
+        if op == "read_u16_le":
+            self.emit_op("i64.load16_u", 0, 0)
+            return VAL_I64
+
+        if op == "read_u32_le":
+            self.emit_op("i64.load32_u", 0, 0)
+            return VAL_I64
+
+        if op == "read_u64_le":
+            self.emit_op("i64.load", 0, 0)
+            return VAL_I64
+
+        if op == "write_byte":
+            self.emit_expr(items[3], env)
+            self.emit_op("i64.store8", 0, 0)
+            self.emit_op("i64.const", 1)
+            return VAL_I64
+
+        if op in ("write_u16_le", "write_u32_le", "write_u64_le"):
+            self.emit_expr(items[3], env)
+            store_map = {"write_u16_le": ("i64.store16", 2), "write_u32_le": ("i64.store32", 4), "write_u64_le": ("i64.store", 8)}
+            sop, nbytes = store_map[op]
+            self.emit_op(sop, 0, 0)
+            self.emit_op("i64.const", nbytes)
+            return VAL_I64
+
+        if op in ("write_u16_be", "write_u32_be", "write_u64_be"):
+            nbytes = {"write_u16_be": 2, "write_u32_be": 4, "write_u64_be": 8}[op]
+            addr_loc = self.alloc_local(VAL_I32, f"{op}_addr")
+            val_loc = self.alloc_local(VAL_I64, f"{op}_val")
+            self.emit_op("local.set", addr_loc, f"{op}_addr")
+            self.emit_expr(items[3], env)
+            self.emit_op("local.set", val_loc, f"{op}_val")
+            for byte_i in range(nbytes):
+                shift = (nbytes - 1 - byte_i) * 8
+                self.emit_op("local.get", addr_loc, f"{op}_addr")
+                self.emit_op("local.get", val_loc, f"{op}_val")
+                if shift > 0:
+                    self.emit_op("i64.const", shift)
+                    self.emit_op("i64.shr_u")
+                self.emit_op("i64.store8", 0, byte_i)
+            self.emit_op("i64.const", nbytes)
             return VAL_I64
 
         if op == "bytes_eq4":
@@ -831,6 +1055,105 @@ def _build_allocator_functions(start_fn_idx: int) -> list[WasmFuncDef]:
     )
 
     return [alloc_fn, mark_fn, reset_fn]
+
+
+def _build_mul_div_function() -> WasmFuncDef:
+    # $__ail_mul_div_u64(a: i64, b: i64, d: i64, is_ceil: i32) -> i64
+    fn = WasmFuncDef(
+        name="__ail_mul_div_u64",
+        params=[("a", VAL_I64), ("b", VAL_I64), ("d", VAL_I64), ("is_ceil", VAL_I32)],
+        results=(VAL_I64,),
+        locals_decls=[
+            ("a_lo", VAL_I64),   # 4
+            ("a_hi", VAL_I64),   # 5
+            ("b_lo", VAL_I64),   # 6
+            ("b_hi", VAL_I64),   # 7
+            ("p0", VAL_I64),     # 8
+            ("p1", VAL_I64),     # 9
+            ("p2", VAL_I64),     # 10
+            ("p3", VAL_I64),     # 11
+            ("mid", VAL_I64),    # 12
+            ("lo", VAL_I64),     # 13
+            ("hi", VAL_I64),     # 14
+            ("nlo", VAL_I64),    # 15
+            ("rem", VAL_I64),    # 16
+            ("quot", VAL_I64),   # 17
+            ("msb", VAL_I64),    # 18
+            ("step", VAL_I32),   # 19
+        ],
+    )
+    fn.instrs = [
+        # a_lo, a_hi, b_lo, b_hi
+        ("local.get", 0, "a"), ("i64.const", 0xFFFFFFFF), ("i64.and",), ("local.set", 4, "a_lo"),
+        ("local.get", 0, "a"), ("i64.const", 32), ("i64.shr_u",), ("local.set", 5, "a_hi"),
+        ("local.get", 1, "b"), ("i64.const", 0xFFFFFFFF), ("i64.and",), ("local.set", 6, "b_lo"),
+        ("local.get", 1, "b"), ("i64.const", 32), ("i64.shr_u",), ("local.set", 7, "b_hi"),
+        # p0..p3
+        ("local.get", 4, "a_lo"), ("local.get", 6, "b_lo"), ("i64.mul",), ("local.set", 8, "p0"),
+        ("local.get", 4, "a_lo"), ("local.get", 7, "b_hi"), ("i64.mul",), ("local.set", 9, "p1"),
+        ("local.get", 5, "a_hi"), ("local.get", 6, "b_lo"), ("i64.mul",), ("local.set", 10, "p2"),
+        ("local.get", 5, "a_hi"), ("local.get", 7, "b_hi"), ("i64.mul",), ("local.set", 11, "p3"),
+        # mid = (p0 >> 32) + (p1 & 0xFFFFFFFF) + (p2 & 0xFFFFFFFF)
+        ("local.get", 8, "p0"), ("i64.const", 32), ("i64.shr_u",),
+        ("local.get", 9, "p1"), ("i64.const", 0xFFFFFFFF), ("i64.and",), ("i64.add",),
+        ("local.get", 10, "p2"), ("i64.const", 0xFFFFFFFF), ("i64.and",), ("i64.add",),
+        ("local.set", 12, "mid"),
+        # lo = (p0 & 0xFFFFFFFF) | (mid << 32)
+        ("local.get", 8, "p0"), ("i64.const", 0xFFFFFFFF), ("i64.and",),
+        ("local.get", 12, "mid"), ("i64.const", 32), ("i64.shl",), ("i64.or",),
+        ("local.set", 13, "lo"),
+        # hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32)
+        ("local.get", 11, "p3"),
+        ("local.get", 9, "p1"), ("i64.const", 32), ("i64.shr_u",), ("i64.add",),
+        ("local.get", 10, "p2"), ("i64.const", 32), ("i64.shr_u",), ("i64.add",),
+        ("local.get", 12, "mid"), ("i64.const", 32), ("i64.shr_u",), ("i64.add",),
+        ("local.set", 14, "hi"),
+        # if is_ceil: nlo = lo + (d - 1); if nlo <u lo: hi += 1; lo = nlo
+        ("local.get", 3, "is_ceil"),
+        ("if", BLOCK_VOID),
+        ("local.get", 13, "lo"),
+        ("local.get", 2, "d"), ("i64.const", 1), ("i64.sub",),
+        ("i64.add",),
+        ("local.tee", 15, "nlo"),
+        ("local.get", 13, "lo"),
+        ("i64.lt_u",),
+        ("if", BLOCK_VOID),
+        ("local.get", 14, "hi"), ("i64.const", 1), ("i64.add",), ("local.set", 14, "hi"),
+        ("end",),
+        ("local.get", 15, "nlo"), ("local.set", 13, "lo"),
+        ("end",),
+        # if hi == 0: return lo /u d
+        ("local.get", 14, "hi"), ("i64.eqz",),
+        ("if", BLOCK_VOID),
+        ("local.get", 13, "lo"), ("local.get", 2, "d"), ("i64.div_u",), ("return",),
+        ("end",),
+        # rem = hi %u d; quot = 0; step = 0
+        ("local.get", 14, "hi"), ("local.get", 2, "d"), ("i64.rem_u",), ("local.set", 16, "rem"),
+        ("i64.const", 0), ("local.set", 17, "quot"),
+        ("i32.const", 0), ("local.set", 19, "step"),
+        ("block", BLOCK_VOID),
+        ("loop", BLOCK_VOID),
+        ("local.get", 19, "step"), ("i32.const", 64), ("i32.ge_u",), ("br_if", 1),
+        ("local.get", 16, "rem"), ("i64.const", 63), ("i64.shr_u",), ("local.set", 18, "msb"),
+        ("local.get", 16, "rem"), ("i64.const", 1), ("i64.shl",),
+        ("local.get", 13, "lo"), ("i64.const", 63), ("i64.shr_u",), ("i64.or",),
+        ("local.set", 16, "rem"),
+        ("local.get", 13, "lo"), ("i64.const", 1), ("i64.shl",), ("local.set", 13, "lo"),
+        ("local.get", 17, "quot"), ("i64.const", 1), ("i64.shl",), ("local.set", 17, "quot"),
+        ("local.get", 18, "msb"), ("i64.const", 0), ("i64.ne",),
+        ("local.get", 16, "rem"), ("local.get", 2, "d"), ("i64.ge_u",),
+        ("i32.or",),
+        ("if", BLOCK_VOID),
+        ("local.get", 16, "rem"), ("local.get", 2, "d"), ("i64.sub",), ("local.set", 16, "rem"),
+        ("local.get", 17, "quot"), ("i64.const", 1), ("i64.or",), ("local.set", 17, "quot"),
+        ("end",),
+        ("local.get", 19, "step"), ("i32.const", 1), ("i32.add",), ("local.set", 19, "step"),
+        ("br", 0),
+        ("end",),
+        ("end",),
+        ("local.get", 17, "quot"),
+    ]
+    return fn
 
 
 def _encode_instrs(instrs: list[tuple[Any, ...]]) -> bytes:
@@ -1084,39 +1407,86 @@ def _emit_mjs_wrapper(
         "",
         "const _u64 = (v) => BigInt.asUintN(64, BigInt(v));",
         "const _i64 = (v) => BigInt.asIntN(64, BigInt(v));",
+        "function _flattenSlots(v) {",
+        "  if (v && typeof v === 'object') {",
+        "    if (typeof v.tag === 'number' && Array.isArray(v.fields)) {",
+        "      const out = [_u64(v.tag)];",
+        "      for (const f of v.fields) out.push(..._flattenSlots(f));",
+        "      return out;",
+        "    }",
+        "    const out = [];",
+        "    for (const k of Object.keys(v)) out.push(..._flattenSlots(v[k]));",
+        "    return out;",
+        "  }",
+        "  return [_u64(v ?? 0n)];",
+        "}",
         "",
     ]
 
+    type_order = tenv.type_order or (
+        [("struct", s) for s in tenv.structs] + [("enum", e) for e in tenv.enums]
+    )
+
     # Struct classes / callable constructors (matches both `Quote(...)` and `new Quote(...)`)
-    for sdef in tenv.structs.values():
-        ctor_params = ", ".join(f"{fd.name} = 0n" for fd in sdef.fields)
+    for tkind, tname in type_order:
+        if tkind != "struct" or tname not in tenv.structs:
+            continue
+        sdef = tenv.structs[tname]
+        ctor_defaults: list[str] = []
+        arg_names: list[str] = []
+        for idx, fd in enumerate(sdef.fields):
+            aname = f"_a{idx}"
+            arg_names.append(aname)
+            if fd.kind.startswith("struct:"):
+                sub_s = fd.kind.split(":", 1)[1]
+                ctor_defaults.append(f"{aname} = new {sub_s}()")
+            elif fd.kind.startswith("enum:"):
+                sub_e = fd.kind.split(":", 1)[1]
+                ctor_defaults.append(f"{aname} = new {sub_e}(0, [])")
+            else:
+                ctor_defaults.append(f"{aname} = 0n")
+        ctor_params = ", ".join(ctor_defaults)
         lines.append(f"export function {sdef.name}({ctor_params}) {{")
         lines.append(f"  if (!(this instanceof {sdef.name})) {{")
-        lines.append(f"    return new {sdef.name}({', '.join(fd.name for fd in sdef.fields)});")
+        lines.append(f"    return new {sdef.name}({', '.join(arg_names)});")
         lines.append("  }")
-        for fd in sdef.fields:
-            conv = "_i64" if fd.kind == "i64" else "_u64"
-            lines.append(f"  this.{fd.name} = {conv}({fd.name});")
+        for aname, fd in zip(arg_names, sdef.fields):
+            if fd.kind.startswith(("struct:", "enum:")):
+                lines.append(f"  this.{fd.name} = {aname};")
+            else:
+                conv = "_i64" if fd.kind == "i64" else "_u64"
+                lines.append(f"  this.{fd.name} = {conv}({aname});")
         lines.append("}")
         lines.append("")
 
     # Tagged Enum classes (`EnumName.VariantName(...)`, `TAG_VariantName`, `.field(idx, signed)`)
-    for edef in tenv.enums.values():
+    for tkind, tname in type_order:
+        if tkind != "enum" or tname not in tenv.enums:
+            continue
+        edef = tenv.enums[tname]
+        max_slots = edef.max_payload_slots(tenv.structs, tenv.enums)
         lines.append(f"export class {edef.name} {{")
         lines.append('  constructor(tag, fields = [], variant = "") {')
         lines.append("    this.tag = Number(tag);")
         lines.append("    this.fields = fields;")
         lines.append("    this.variant = variant;")
-        for p_idx in range(edef.max_fields):
-            lines.append(f"    this._p{p_idx} = fields[{p_idx}] ?? 0n;")
+        lines.append("    const _flat = fields.flatMap((f) => _flattenSlots(f));")
+        for p_idx in range(max_slots):
+            lines.append(f"    this._p{p_idx} = _flat[{p_idx}] ?? 0n;")
         lines.append("  }")
         for vdef in edef.variants:
             lines.append(f"  static TAG_{vdef.name} = {vdef.tag};")
         for vdef in edef.variants:
-            vparams = ", ".join(fd.name for fd in vdef.fields)
-            conv_elems = ", ".join(
-                f"{'_i64' if fd.kind == 'i64' else '_u64'}({fd.name})" for fd in vdef.fields
-            )
+            varg_names = [f"_a{idx}" for idx in range(len(vdef.fields))]
+            vparams = ", ".join(varg_names)
+            conv_elems_list: list[str] = []
+            for aname, fd in zip(varg_names, vdef.fields):
+                if fd.kind.startswith(("struct:", "enum:")):
+                    conv_elems_list.append(aname)
+                else:
+                    conv = "_i64" if fd.kind == "i64" else "_u64"
+                    conv_elems_list.append(f"{conv}({aname})")
+            conv_elems = ", ".join(conv_elems_list)
             lines.append(f"  static {vdef.name}({vparams}) {{")
             lines.append(f'    const inst = new {edef.name}({vdef.tag}, [{conv_elems}], "{vdef.name}");')
             for idx, fd in enumerate(vdef.fields):
@@ -1125,57 +1495,103 @@ def _emit_mjs_wrapper(
             lines.append("    return inst;")
             lines.append("  }")
         lines.append("  field(idx, signed = false) {")
-        lines.append("    const raw = _u64(this.fields[idx] ?? 0n);")
+        lines.append("    const raw = _u64(this[`_p${idx}`] ?? this.fields[idx] ?? 0n);")
         lines.append("    return signed ? _i64(raw) : raw;")
         lines.append("  }")
         lines.append("}")
         lines.append("")
 
-    # Marshaling helpers for structs and enums
-    for sdef in tenv.structs.values():
-        size = max(8, 8 * len(sdef.fields))
-        lines.append(f"function _write_{sdef.name}(rawExports, memory, val) {{")
-        lines.append(f"  const ptr = rawExports.__ail_alloc({size});")
-        lines.append("  const dv = new DataView(memory.buffer);")
-        for idx, fd in enumerate(sdef.fields):
-            setter = "setBigInt64" if fd.kind == "i64" else "setBigUint64"
-            conv = "_i64" if fd.kind == "i64" else "_u64"
-            lines.append(f"  dv.{setter}(ptr + {idx * 8}, {conv}(val.{fd.name}), true);")
-        lines.append("  return ptr;")
-        lines.append("}")
-        lines.append(f"function _read_{sdef.name}(memory, ptr) {{")
-        lines.append("  const dv = new DataView(memory.buffer);")
-        reads = []
-        for idx, fd in enumerate(sdef.fields):
-            getter = "getBigInt64" if fd.kind == "i64" else "getBigUint64"
-            reads.append(f"dv.{getter}(ptr + {idx * 8}, true)")
-        lines.append(f"  return new {sdef.name}({', '.join(reads)});")
-        lines.append("}")
-        lines.append("")
-
-    for edef in tenv.enums.values():
-        size = 8 * (1 + edef.max_fields)
-        lines.append(f"function _write_{edef.name}(rawExports, memory, val) {{")
-        lines.append(f"  const ptr = rawExports.__ail_alloc({size});")
-        lines.append("  const dv = new DataView(memory.buffer);")
-        lines.append("  dv.setBigUint64(ptr, _u64(val.tag), true);")
-        lines.append("  const fields = val.fields ?? [];")
-        for p_idx in range(edef.max_fields):
-            lines.append(f"  dv.setBigUint64(ptr + {(1 + p_idx) * 8}, _u64(fields[{p_idx}] ?? 0n), true);")
-        lines.append("  return ptr;")
-        lines.append("}")
-        lines.append(f"function _read_{edef.name}(memory, ptr) {{")
-        lines.append("  const dv = new DataView(memory.buffer);")
-        lines.append("  const tag = Number(dv.getBigUint64(ptr, true));")
-        for vdef in edef.variants:
-            vreads = []
-            for fidx, fd in enumerate(vdef.fields):
-                getter = "getBigInt64" if fd.kind == "i64" else "getBigUint64"
-                vreads.append(f"dv.{getter}(ptr + {(1 + fidx) * 8}, true)")
-            lines.append(f"  if (tag === {vdef.tag}) return {edef.name}.{vdef.name}({', '.join(vreads)});")
-        lines.append(f"  return new {edef.name}(tag, []);")
-        lines.append("}")
-        lines.append("")
+    # Marshaling helpers for structs and enums (in topological type_order)
+    for tkind, tname in type_order:
+        if tkind == "struct" and tname in tenv.structs:
+            sdef = tenv.structs[tname]
+            nslots = kind_u64_slots(f"struct:{sdef.name}", tenv.structs, tenv.enums)
+            size = max(8, 8 * nslots)
+            lines.append(f"function _write_{sdef.name}_at(dv, baseOff, val) {{")
+            cur_slot = 0
+            for fd in sdef.fields:
+                if fd.kind.startswith(("struct:", "enum:")):
+                    sub_name = fd.kind.split(":", 1)[1]
+                    lines.append(f"  _write_{sub_name}_at(dv, baseOff + {cur_slot * 8}, val?.{fd.name});")
+                else:
+                    setter = "setBigInt64" if fd.kind == "i64" else "setBigUint64"
+                    conv = "_i64" if fd.kind == "i64" else "_u64"
+                    lines.append(f"  dv.{setter}(baseOff + {cur_slot * 8}, {conv}(val?.{fd.name} ?? 0n), true);")
+                cur_slot += kind_u64_slots(fd.kind, tenv.structs, tenv.enums)
+            lines.append("}")
+            lines.append(f"function _write_{sdef.name}(rawExports, memory, val) {{")
+            lines.append(f"  const ptr = rawExports.__ail_alloc({size});")
+            lines.append("  _write_" + sdef.name + "_at(new DataView(memory.buffer), ptr, val);")
+            lines.append("  return ptr;")
+            lines.append("}")
+            lines.append(f"function _read_{sdef.name}_at(dv, baseOff) {{")
+            reads: list[str] = []
+            cur_slot = 0
+            for fd in sdef.fields:
+                if fd.kind.startswith(("struct:", "enum:")):
+                    sub_name = fd.kind.split(":", 1)[1]
+                    reads.append(f"_read_{sub_name}_at(dv, baseOff + {cur_slot * 8})")
+                else:
+                    getter = "getBigInt64" if fd.kind == "i64" else "getBigUint64"
+                    reads.append(f"dv.{getter}(baseOff + {cur_slot * 8}, true)")
+                cur_slot += kind_u64_slots(fd.kind, tenv.structs, tenv.enums)
+            lines.append(f"  return new {sdef.name}({', '.join(reads)});")
+            lines.append("}")
+            lines.append(f"function _read_{sdef.name}(memory, ptr) {{")
+            lines.append(f"  return _read_{sdef.name}_at(new DataView(memory.buffer), ptr);")
+            lines.append("}")
+            lines.append("")
+        elif tkind == "enum" and tname in tenv.enums:
+            edef = tenv.enums[tname]
+            max_slots = edef.max_payload_slots(tenv.structs, tenv.enums)
+            size = 8 * (1 + max_slots)
+            lines.append(f"function _write_{edef.name}_at(dv, baseOff, val) {{")
+            lines.append("  const tag = Number(val?.tag ?? 0);")
+            lines.append("  dv.setBigUint64(baseOff, _u64(tag), true);")
+            lines.append(f"  for (let _s = 0; _s < {max_slots}; _s++) dv.setBigUint64(baseOff + (1 + _s) * 8, 0n, true);")
+            lines.append("  const fields = val?.fields ?? [];")
+            for vdef in edef.variants:
+                if not vdef.fields:
+                    continue
+                lines.append(f"  if (tag === {vdef.tag}) {{")
+                cur_slot = 1
+                for fidx, fd in enumerate(vdef.fields):
+                    if fd.kind.startswith(("struct:", "enum:")):
+                        sub_name = fd.kind.split(":", 1)[1]
+                        lines.append(f"    _write_{sub_name}_at(dv, baseOff + {cur_slot * 8}, fields[{fidx}]);")
+                    else:
+                        setter = "setBigInt64" if fd.kind == "i64" else "setBigUint64"
+                        conv = "_i64" if fd.kind == "i64" else "_u64"
+                        lines.append(f"    dv.{setter}(baseOff + {cur_slot * 8}, {conv}(fields[{fidx}] ?? val?._p{cur_slot - 1} ?? 0n), true);")
+                    cur_slot += kind_u64_slots(fd.kind, tenv.structs, tenv.enums)
+                lines.append("    return;")
+                lines.append("  }")
+            lines.append("}")
+            lines.append(f"function _write_{edef.name}(rawExports, memory, val) {{")
+            lines.append(f"  const ptr = rawExports.__ail_alloc({size});")
+            lines.append(f"  _write_{edef.name}_at(new DataView(memory.buffer), ptr, val);")
+            lines.append("  return ptr;")
+            lines.append("}")
+            lines.append(f"function _read_{edef.name}_at(dv, baseOff) {{")
+            lines.append("  const tag = Number(dv.getBigUint64(baseOff, true));")
+            for vdef in edef.variants:
+                vreads: list[str] = []
+                cur_slot = 1
+                for fd in vdef.fields:
+                    if fd.kind.startswith(("struct:", "enum:")):
+                        sub_name = fd.kind.split(":", 1)[1]
+                        vreads.append(f"_read_{sub_name}_at(dv, baseOff + {cur_slot * 8})")
+                    else:
+                        getter = "getBigInt64" if fd.kind == "i64" else "getBigUint64"
+                        vreads.append(f"dv.{getter}(baseOff + {cur_slot * 8}, true)")
+                    cur_slot += kind_u64_slots(fd.kind, tenv.structs, tenv.enums)
+                lines.append(f"  if (tag === {vdef.tag}) return {edef.name}.{vdef.name}({', '.join(vreads)});")
+            lines.append(f"  return new {edef.name}(tag, []);")
+            lines.append("}")
+            lines.append(f"function _read_{edef.name}(memory, ptr) {{")
+            lines.append(f"  return _read_{edef.name}_at(new DataView(memory.buffer), ptr);")
+            lines.append("}")
+            lines.append("")
 
     # Instantiate factory
     lines.extend(
@@ -1246,6 +1662,7 @@ def _emit_mjs_wrapper(
         param_name_to_js = {p.name: f"_arg{i}" for i, p in enumerate(ex.params)}
         call_arg_exprs: list[str] = []
         mut_writebacks: list[tuple[str, str, str, bool]] = []
+        mut_bytes_writebacks: list[tuple[str, str, str]] = []
         atomic_writebacks: list[tuple[str, str]] = []
 
         for idx, p in enumerate(ex.params):
@@ -1259,14 +1676,16 @@ def _emit_mjs_wrapper(
             elif p.ail_kind.startswith("struct:") or p.ail_kind.startswith("enum:"):
                 lines.append(f"      const _v{idx} = _write_{p.struct_or_enum_name}(rawExports, memory, {aname});")
                 call_arg_exprs.append(f"_v{idx}")
-            elif p.ail_kind == "bytes":
+            elif p.ail_kind in ("bytes", "mut_bytes"):
                 len_expr = _js_len_expr(p.len_source, param_name_to_js, aname)
                 lines.append(f"      const _u8_{idx} = {aname} instanceof Uint8Array ? {aname} : ({aname} instanceof ArrayBuffer ? new Uint8Array({aname}) : Uint8Array.from({aname}));")
                 lines.append(f"      const _len_{idx} = {len_expr};")
-                lines.append(f"      if (_u8_{idx}.length < _len_{idx}) throw new RangeError(`bytes buffer shorter than declared length (${{_len_{idx}}})`);")
+                lines.append(f"      if (_u8_{idx}.length < _len_{idx}) throw new RangeError(`{p.ail_kind} buffer shorter than declared length (${{_len_{idx}}})`);")
                 lines.append(f"      const _v{idx} = _len_{idx} === 0 ? 0 : rawExports.__ail_alloc(_len_{idx});")
                 lines.append(f"      if (_len_{idx} > 0) new Uint8Array(memory.buffer, _v{idx}, _len_{idx}).set(_u8_{idx}.subarray(0, _len_{idx}));")
                 call_arg_exprs.append(f"_v{idx}")
+                if p.ail_kind == "mut_bytes":
+                    mut_bytes_writebacks.append((aname, f"_v{idx}", f"_len_{idx}"))
             elif p.ail_kind in ("slice", "mut_slice"):
                 len_expr = _js_len_expr(p.len_source, param_name_to_js, aname)
                 setter = "setBigInt64" if p.elem_is_i64 else "setBigUint64"
@@ -1301,6 +1720,15 @@ def _emit_mjs_wrapper(
             lines.append("      }")
         for target_cell, ptr_var in atomic_writebacks:
             lines.append(f"      {target_cell}[0] = new DataView(memory.buffer).getBigUint64({ptr_var}, true);")
+        for target_bytes, ptr_var, len_var in mut_bytes_writebacks:
+            lines.append(f"      if ({len_var} > 0) {{")
+            lines.append(f"        const _outB = new Uint8Array(memory.buffer, {ptr_var}, {len_var});")
+            lines.append(f"        if ({target_bytes} instanceof Uint8Array) {{")
+            lines.append(f"          {target_bytes}.set(_outB);")
+            lines.append(f"        }} else if (Array.isArray({target_bytes})) {{")
+            lines.append(f"          for (let _i = 0; _i < {len_var}; _i++) {target_bytes}[_i] = _outB[_i];")
+            lines.append("        }")
+            lines.append("      }")
 
         if ex.ret_kind == "u64":
             lines.append("      return _u64(_res);")
@@ -1370,31 +1798,47 @@ def _emit_dts_types(
         "",
     ]
 
-    for sdef in tenv.structs.values():
-        lines.append(f"export interface {sdef.name} {{")
-        for fd in sdef.fields:
-            lines.append(f"  {fd.name}: bigint;")
-        lines.append("}")
-        ctor_args = ", ".join(f"{fd.name}?: bigint | number" for fd in sdef.fields)
-        lines.append(f"export const {sdef.name}: {{")
-        lines.append(f"  new ({ctor_args}): {sdef.name};")
-        lines.append(f"  ({ctor_args}): {sdef.name};")
-        lines.append("};")
-        lines.append("")
+    type_order = tenv.type_order or (
+        [("struct", s) for s in tenv.structs] + [("enum", e) for e in tenv.enums]
+    )
 
-    for edef in tenv.enums.values():
-        lines.append(f"export class {edef.name} {{")
-        lines.append("  readonly tag: number;")
-        lines.append("  readonly variant: string;")
-        lines.append("  readonly fields: bigint[];")
-        for vdef in edef.variants:
-            lines.append(f"  static readonly TAG_{vdef.name}: {vdef.tag};")
-        for vdef in edef.variants:
-            vargs = ", ".join(f"{fd.name}: bigint | number" for fd in vdef.fields)
-            lines.append(f"  static {vdef.name}({vargs}): {edef.name};")
-        lines.append("  field(idx: number, signed?: boolean): bigint;")
-        lines.append("}")
-        lines.append("")
+    def _ts_field_ty(kind: str) -> str:
+        if kind.startswith(("struct:", "enum:")):
+            return kind.split(":", 1)[1]
+        return "bigint"
+
+    def _ts_ctor_ty(kind: str) -> str:
+        if kind.startswith(("struct:", "enum:")):
+            return kind.split(":", 1)[1]
+        return "bigint | number"
+
+    for tkind, tname in type_order:
+        if tkind == "struct" and tname in tenv.structs:
+            sdef = tenv.structs[tname]
+            lines.append(f"export interface {sdef.name} {{")
+            for fd in sdef.fields:
+                lines.append(f"  {fd.name}: {_ts_field_ty(fd.kind)};")
+            lines.append("}")
+            ctor_args = ", ".join(f"{fd.name}?: {_ts_ctor_ty(fd.kind)}" for fd in sdef.fields)
+            lines.append(f"export const {sdef.name}: {{")
+            lines.append(f"  new ({ctor_args}): {sdef.name};")
+            lines.append(f"  ({ctor_args}): {sdef.name};")
+            lines.append("};")
+            lines.append("")
+        elif tkind == "enum" and tname in tenv.enums:
+            edef = tenv.enums[tname]
+            lines.append(f"export class {edef.name} {{")
+            lines.append("  readonly tag: number;")
+            lines.append("  readonly variant: string;")
+            lines.append("  readonly fields: unknown[];")
+            for vdef in edef.variants:
+                lines.append(f"  static readonly TAG_{vdef.name}: {vdef.tag};")
+            for vdef in edef.variants:
+                vargs = ", ".join(f"{fd.name}: {_ts_ctor_ty(fd.kind)}" for fd in vdef.fields)
+                lines.append(f"  static {vdef.name}({vargs}): {edef.name};")
+            lines.append("  field(idx: number, signed?: boolean): bigint;")
+            lines.append("}")
+            lines.append("")
 
     _TS_RESERVED = {"break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "import", "in", "instanceof", "new", "null", "return", "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with", "as", "implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"}
 
@@ -1406,6 +1850,8 @@ def _emit_dts_types(
             return "bigint | number"
         if p.ail_kind == "bytes":
             return "Uint8Array | ArrayBuffer | readonly number[]"
+        if p.ail_kind == "mut_bytes":
+            return "Uint8Array | number[]"
         if p.ail_kind == "slice":
             return "BigUint64Array | BigInt64Array | readonly (bigint | number)[]"
         if p.ail_kind == "mut_slice":
@@ -1481,6 +1927,7 @@ def compile_to_wasm(
         tenv = check_module_ownership_v2(forms)
 
     used_imports = _collect_used_host_imports(forms)
+    uses_mul_div = _collect_used_mul_div(forms)
     imports: list[tuple[str, str, tuple[int, ...], tuple[int, ...]]] = [
         ("env", HOST_IMPORT_SPECS[name][0], HOST_IMPORT_SPECS[name][1], HOST_IMPORT_SPECS[name][2])
         for name in used_imports
@@ -1488,7 +1935,8 @@ def compile_to_wasm(
 
     fn_indices: dict[str, int] = {name: i for i, name in enumerate(used_imports)}
     alloc_fn_idx = len(imports)
-    next_idx = len(imports) + 3  # +3 for __ail_alloc, __ail_heap_mark, __ail_heap_reset
+    mul_div_fn_idx = (len(imports) + 3) if uses_mul_div else None
+    next_idx = len(imports) + (4 if uses_mul_div else 3)
 
     runtime_forms: list[SNode] = []
     existing_names: set[str] = set()
@@ -1503,6 +1951,8 @@ def compile_to_wasm(
 
     proto_steps = _collect_proto_steps(forms)
     compiled_funcs: list[WasmFuncDef] = _build_allocator_functions(alloc_fn_idx)
+    if uses_mul_div:
+        compiled_funcs.append(_build_mul_div_function())
     exports: list[WasmExportInfo] = []
 
     for form in runtime_forms:
@@ -1534,7 +1984,7 @@ def compile_to_wasm(
                         name=pname,
                         ail_kind=pk,
                         wasm_ty=wty,
-                        len_source=_len_source_from_spec(p.val[1]) if pk in ("slice", "mut_slice", "bytes") else None,
+                        len_source=_len_source_from_spec(p.val[1]) if pk in ("slice", "mut_slice", "bytes", "mut_bytes") else None,
                         elem_is_i64=_slice_elem_is_i64(p.val[1]) if pk in ("slice", "mut_slice") else False,
                         struct_or_enum_name=pk.split(":", 1)[1] if pk.startswith(("struct:", "enum:")) else None,
                     )
@@ -1542,7 +1992,14 @@ def compile_to_wasm(
 
             ret_wty = _wasm_valtype_for_kind(sig.ret_kind)
             results: tuple[int, ...] = () if ret_wty is None else (ret_wty,)
-            builder = _WasmFuncBuilder(tenv, fn_indices, alloc_fn_idx, [pn for pn, _ in wasm_params], [pt for _, pt in wasm_params])
+            builder = _WasmFuncBuilder(
+                tenv,
+                fn_indices,
+                alloc_fn_idx,
+                [pn for pn, _ in wasm_params],
+                [pt for _, pt in wasm_params],
+                mul_div_fn_idx=mul_div_fn_idx,
+            )
             builder.emit_expr(body_n, env)
 
             if is_main:
@@ -1592,7 +2049,7 @@ def compile_to_wasm(
                 wasm_params.append((pname, wty))
                 env[pname] = (p_idx, wty, pk)
                 is_i64_el = _slice_elem_is_i64(p.val[1]) if pk in ("slice", "mut_slice") else False
-                lsrc = _len_source_from_spec(p.val[1]) if pk in ("slice", "mut_slice", "bytes") else None
+                lsrc = _len_source_from_spec(p.val[1]) if pk in ("slice", "mut_slice", "bytes", "mut_bytes") else None
                 if pk == "mut_slice":
                     buf_loc = p_idx
                     len_source = lsrc
@@ -1607,7 +2064,14 @@ def compile_to_wasm(
                     )
                 )
 
-            builder = _WasmFuncBuilder(tenv, fn_indices, alloc_fn_idx, [pn for pn, _ in wasm_params], [pt for _, pt in wasm_params])
+            builder = _WasmFuncBuilder(
+                tenv,
+                fn_indices,
+                alloc_fn_idx,
+                [pn for pn, _ in wasm_params],
+                [pt for _, pt in wasm_params],
+                mul_div_fn_idx=mul_div_fn_idx,
+            )
             idx_loc = builder.alloc_local(VAL_I64, "map_idx")
             elem_ptr_loc = builder.alloc_local(VAL_I32, "map_ptr")
             elem_loc = builder.alloc_local(VAL_I64, elem_var)

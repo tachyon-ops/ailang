@@ -742,14 +742,14 @@ fn main() {
 
 
 def test_v1_cli_commands_imports_pb_and_studio_regen(tmp_path: Path) -> None:
-    assert __version__ == "1.0.0"
+    assert __version__ == "1.1.0"
 
     # 1. `ail stdlib`
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         assert cli_main(["stdlib"]) == 0
     stdlib_out = buf.getvalue()
-    for mod_name in ("stdlib/bits", "stdlib/finance", "stdlib/math", "stdlib/parse"):
+    for mod_name in ("stdlib/bits", "stdlib/finance", "stdlib/math", "stdlib/parse", "stdlib/wire"):
         assert mod_name in stdlib_out
 
     # 2. Import cycle rejected by `ail check` with E_IMPORT_CYCLE
@@ -784,7 +784,7 @@ def test_v1_cli_commands_imports_pb_and_studio_regen(tmp_path: Path) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         assert cli_main(["studio", "--regenerate-demos", "--out", str(demos_out)]) == 0
     demos = json.loads(demos_out.read_text(encoding="utf-8"))
-    assert demos["version"] == "1.0.0"
+    assert demos["version"] == "1.1.0"
     assert len(demos["presets"]) >= 5
 
     # 5. `audit-spec` & `build --target all --require-tight-specs` on import-using `defi_waterfall_v1.ail`

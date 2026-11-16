@@ -9,7 +9,14 @@ import re
 import subprocess
 
 from ailang.diagnostics import I64_MAX, I64_MIN, U64_MAX
-from ailang.ownership import EnumDef, LINEAR_CAPS, ModuleTypeEnv, StructDef, check_module_ownership_v2
+from ailang.ownership import (
+    EnumDef,
+    LINEAR_CAPS,
+    ModuleTypeEnv,
+    StructDef,
+    check_module_ownership_v2,
+    kind_u64_slots,
+)
 from ailang.parser import SNode
 
 _C11_KEYWORDS = frozenset(
@@ -105,11 +112,15 @@ def _c_value_type(kind: str) -> str:
     return "uint64_t"
 
 
-def _c_zero_init(kind: str) -> str:
+def _c_zero_init(kind: str, structs: dict[str, StructDef] | None = None) -> str:
     if kind == "i64":
         return "INT64_C(0)"
     if kind == "bool":
         return "false"
+    if kind.startswith("struct:") and structs is not None:
+        sdef = structs[kind.split(":", 1)[1]]
+        inits = ", ".join(_c_zero_init(fd.kind, structs) for fd in sdef.fields) or "UINT64_C(0)"
+        return f"{{ {inits} }}"
     if kind.startswith(("struct:", "enum:")):
         return "{ 0 }"
     return "UINT64_C(0)"
@@ -202,6 +213,64 @@ class CFunctionEmitter:
         self.used_helpers.add(helper)
         return helper
 
+    def _emit_c_flatten_slots(self, expr: str, kind: str, indent: str) -> list[str]:
+        if kind == "u64":
+            return [expr]
+        if kind == "i64":
+            return [f"(uint64_t)({expr})"]
+        if kind.startswith("struct:"):
+            sname = kind.split(":", 1)[1]
+            sdef = self.tenv.structs[sname]
+            tmp_s = self.fresh_tmp("ail_fl")
+            self.lines.append(f"{indent}{sname} {tmp_s} = {expr};")
+            out: list[str] = []
+            for fd in sdef.fields:
+                out.extend(self._emit_c_flatten_slots(f"{tmp_s}.{fd.name}", fd.kind, indent))
+            return out or ["UINT64_C(0)"]
+        if kind.startswith("enum:"):
+            ename = kind.split(":", 1)[1]
+            edef = self.tenv.enums[ename]
+            tmp_e = self.fresh_tmp("ail_fl")
+            self.lines.append(f"{indent}{ename} {tmp_e} = {expr};")
+            nslots = edef.max_payload_slots(self.tenv.structs, self.tenv.enums)
+            return [f"{tmp_e}.tag", *[f"{tmp_e}._p{i}" for i in range(nslots)]]
+        return [expr]
+
+    def _emit_c_unflatten(
+        self,
+        slots: list[str],
+        kind: str,
+        offset: int = 0,
+        indent: str = "    ",
+    ) -> tuple[str, int]:
+        if kind == "u64":
+            return slots[offset], offset + 1
+        if kind == "i64":
+            return f"{self._use('ail_u64_to_i64')}({slots[offset]})", offset + 1
+        if kind.startswith("struct:"):
+            sname = kind.split(":", 1)[1]
+            sdef = self.tenv.structs[sname]
+            cur_off = offset
+            fexprs: list[str] = []
+            for fd in sdef.fields:
+                fe, cur_off = self._emit_c_unflatten(slots, fd.kind, cur_off, indent)
+                fexprs.append(fe)
+            s_var = self.fresh_tmp("ail_uf")
+            init_s = ", ".join(fexprs) if fexprs else "UINT64_C(0)"
+            self.lines.append(f"{indent}{sname} {s_var} = {{ {init_s} }};")
+            return s_var, cur_off
+        if kind.startswith("enum:"):
+            ename = kind.split(":", 1)[1]
+            edef = self.tenv.enums[ename]
+            nslots = edef.max_payload_slots(self.tenv.structs, self.tenv.enums)
+            e_var = self.fresh_tmp("ail_uf")
+            self.lines.append(f"{indent}{ename} {e_var} = {{ 0 }};")
+            self.lines.append(f"{indent}{e_var}.tag = {slots[offset]};")
+            for i in range(nslots):
+                self.lines.append(f"{indent}{e_var}._p{i} = {slots[offset + 1 + i]};")
+            return e_var, offset + 1 + nslots
+        return slots[offset], offset + 1
+
     def _emit_into(self, target_var: str, node: SNode, env: dict[str, str], target_kind: str, indent: str) -> None:
         val = self.emit_expr(node, env, target_kind=target_kind, indent=indent)
         if val:
@@ -252,7 +321,7 @@ class CFunctionEmitter:
                     self.uses_bool = True
                 res_var = self.fresh_tmp()
                 res_ty = _c_value_type(nk)
-                self.lines.append(f"{indent}{res_ty} {res_var} = {_c_zero_init(nk)};")
+                self.lines.append(f"{indent}{res_ty} {res_var} = {_c_zero_init(nk, self.tenv.structs)};")
                 self.lines.append(f"{indent}{{")
                 for b in items[1].val:
                     self._emit_let_binding(b, nenv, indent + "    ")
@@ -276,7 +345,7 @@ class CFunctionEmitter:
                 return ""
             res_var = self.fresh_tmp()
             res_ty = _c_value_type(nk)
-            self.lines.append(f"{indent}{res_ty} {res_var} = {_c_zero_init(nk)};")
+            self.lines.append(f"{indent}{res_ty} {res_var} = {_c_zero_init(nk, self.tenv.structs)};")
             self.lines.append(f"{indent}if ({cond_var}) {{")
             self._emit_into(res_var, items[2], env, eff_kind, indent + "    ")
             self.lines.append(f"{indent}}} else {{")
@@ -321,10 +390,12 @@ class CFunctionEmitter:
             e_var = self.fresh_tmp()
             self.lines.append(f"{indent}{ename} {e_var} = {{ 0 }};")
             self.lines.append(f"{indent}{e_var}.tag = UINT64_C({vdef.tag});")
-            for idx, (arg_n, fd) in enumerate(zip(items[3:], vdef.fields)):
+            slot_idx = 0
+            for arg_n, fd in zip(items[3:], vdef.fields):
                 av = self.emit_expr(arg_n, env, target_kind=fd.kind, indent=indent)
-                slot = f"(uint64_t)({av})" if fd.kind == "i64" else av
-                self.lines.append(f"{indent}{e_var}._p{idx} = {slot};")
+                for slot_e in self._emit_c_flatten_slots(av, fd.kind, indent=indent):
+                    self.lines.append(f"{indent}{e_var}._p{slot_idx} = {slot_e};")
+                    slot_idx += 1
             return e_var
 
         if op == "is_variant":
@@ -349,7 +420,7 @@ class CFunctionEmitter:
                 if nk == "bool":
                     self.uses_bool = True
                 res_var = self.fresh_tmp()
-                self.lines.append(f"{indent}{_c_value_type(nk)} {res_var} = {_c_zero_init(nk)};")
+                self.lines.append(f"{indent}{_c_value_type(nk)} {res_var} = {_c_zero_init(nk, self.tenv.structs)};")
 
             arms = items[2:]
             has_wildcard = any(isinstance(arm.val[0].val, str) and arm.val[0].val == "_" for arm in arms)
@@ -374,16 +445,17 @@ class CFunctionEmitter:
                     if not is_wild:
                         vdef = edef.get_variant(str(pat.val[0].val))
                         assert vdef is not None
-                        for fidx, (bnode, fd) in enumerate(zip(pat.val[1:], vdef.fields)):
+                        slot_off = 0
+                        for bnode, fd in zip(pat.val[1:], vdef.fields):
                             bname = str(bnode.val)
                             c_bname = self.bind_local(bname)
                             self.var_kinds[bname] = fd.kind
                             arm_env[bname] = c_bname
-                            if fd.kind == "i64":
-                                rhs = f"{self._use('ail_u64_to_i64')}({scrut_var}._p{fidx})"
-                                self.lines.append(f"{indent}        int64_t {c_bname} = {rhs};")
-                            else:
-                                self.lines.append(f"{indent}        uint64_t {c_bname} = {scrut_var}._p{fidx};")
+                            needed = kind_u64_slots(fd.kind, self.tenv.structs, self.tenv.enums)
+                            slots = [f"{scrut_var}._p{slot_off + i}" for i in range(needed)]
+                            slot_off += needed
+                            val_expr, _ = self._emit_c_unflatten(slots, fd.kind, 0, indent + "        ")
+                            self.lines.append(f"{indent}        {_c_value_type(fd.kind)} {c_bname} = {val_expr};")
                             self.lines.append(f"{indent}        (void){c_bname};")
                     if is_cap:
                         _ = self.emit_expr(arm_body, arm_env, target_kind=nk, indent=indent + "        ")
@@ -475,6 +547,23 @@ class CFunctionEmitter:
             idx_v = self.emit_expr(items[2], env, target_kind="u64", indent=indent)
             return f"{self._use('ail_read_u64_be')}({buf_c}, {idx_v})"
 
+        if op in ("read_u16_le", "read_u32_le", "read_u64_le"):
+            buf_c = self.emit_expr(items[1], env, indent=indent)
+            idx_v = self.emit_expr(items[2], env, target_kind="u64", indent=indent)
+            return f"{self._use(f'ail_{op}')}({buf_c}, {idx_v})"
+
+        if op in ("write_byte", "write_u16_be", "write_u32_be", "write_u64_be", "write_u16_le", "write_u32_le", "write_u64_le"):
+            buf_c = self.emit_expr(items[1], env, indent=indent)
+            idx_v = self.emit_expr(items[2], env, target_kind="u64", indent=indent)
+            val_v = self.emit_expr(items[3], env, target_kind="u64", indent=indent)
+            return f"{self._use(f'ail_{op}')}({buf_c}, {idx_v}, {val_v})"
+
+        if op in ("mul_div_u64", "mul_div_ceil_u64"):
+            a_v = self.emit_expr(items[1], env, target_kind="u64", indent=indent)
+            b_v = self.emit_expr(items[2], env, target_kind="u64", indent=indent)
+            d_v = self.emit_expr(items[3], env, target_kind="u64", indent=indent)
+            return f"{self._use(f'ail_{op}')}({a_v}, {b_v}, {d_v})"
+
         if op == "bytes_eq4":
             buf_c = self.emit_expr(items[1], env, indent=indent)
             idx_v = self.emit_expr(items[2], env, target_kind="u64", indent=indent)
@@ -549,18 +638,10 @@ class CFunctionEmitter:
             rk2 = self._raw_kind(items[2])
             if rk1.startswith("struct:") and rk2.startswith("struct:") and op in ("==", "!="):
                 sname = rk1.split(":", 1)[1]
-                sdef = self.tenv.structs[sname]
                 av = self.emit_expr(items[1], env, indent=indent)
                 bv = self.emit_expr(items[2], env, indent=indent)
-                a_var = self.fresh_tmp()
-                b_var = self.fresh_tmp()
-                self.lines.append(f"{indent}{sname} {a_var} = {av};")
-                self.lines.append(f"{indent}{sname} {b_var} = {bv};")
-                if op == "==":
-                    parts = [f"({a_var}.{fd.name} == {b_var}.{fd.name})" for fd in sdef.fields]
-                    return f"({' && '.join(parts) if parts else 'true'})"
-                parts = [f"({a_var}.{fd.name} != {b_var}.{fd.name})" for fd in sdef.fields]
-                return f"({' || '.join(parts) if parts else 'false'})"
+                eq_call = f"{self._use(f'ail_eq_{sname}')}({av}, {bv})"
+                return eq_call if op == "==" else f"(!{eq_call})"
             if rk1.startswith("enum:") and rk2.startswith("enum:") and op in ("==", "!="):
                 ename = rk1.split(":", 1)[1]
                 av = self.emit_expr(items[1], env, indent=indent)
@@ -637,14 +718,64 @@ class CFunctionEmitter:
         self.lines.append(f"{indent}(void){c_bname};")
 
 
+def _c_slot_eq_expr(
+    a_prefix: str,
+    b_prefix: str,
+    offset: int,
+    kind: str,
+    structs: dict[str, StructDef],
+    enums: dict[str, EnumDef],
+) -> tuple[str, int]:
+    if kind in ("u64", "i64"):
+        return f"({a_prefix}{offset} == {b_prefix}{offset})", offset + 1
+    if kind.startswith("struct:"):
+        sdef = structs[kind.split(":", 1)[1]]
+        cur_off = offset
+        parts: list[str] = []
+        for fd in sdef.fields:
+            fe, cur_off = _c_slot_eq_expr(a_prefix, b_prefix, cur_off, fd.kind, structs, enums)
+            parts.append(fe)
+        return (f"({' && '.join(parts)})" if parts else "true"), cur_off
+    if kind.startswith("enum:"):
+        edef = enums[kind.split(":", 1)[1]]
+        tag_eq = f"({a_prefix}{offset} == {b_prefix}{offset})"
+        v_parts = [tag_eq]
+        for vdef in edef.variants:
+            if not vdef.fields:
+                continue
+            cur_off = offset + 1
+            f_parts: list[str] = []
+            for fd in vdef.fields:
+                fe, cur_off = _c_slot_eq_expr(a_prefix, b_prefix, cur_off, fd.kind, structs, enums)
+                f_parts.append(fe)
+            v_parts.append(f"({a_prefix}{offset} != UINT64_C({vdef.tag}) || ({' && '.join(f_parts)}))")
+        return f"({' && '.join(v_parts)})", offset + 1 + edef.max_payload_slots(structs, enums)
+    return f"({a_prefix}{offset} == {b_prefix}{offset})", offset + 1
+
+
 def _emit_c_helpers(
     used_helpers: set[str],
+    structs: dict[str, StructDef],
     enums: dict[str, EnumDef],
+    type_order: list[tuple[str, str]],
     uses_io: bool,
     uses_fs: bool,
     uses_net: bool,
 ) -> list[str]:
     expanded = set(used_helpers)
+    if expanded & {"ail_mul_div_u64", "ail_mul_div_ceil_u64"}:
+        expanded.add("ail_mul_div_u64_core")
+    changed = True
+    while changed:
+        changed = False
+        for sname, sdef in structs.items():
+            if f"ail_eq_{sname}" in expanded:
+                for fd in sdef.fields:
+                    if fd.kind.startswith(("struct:", "enum:")):
+                        dep = f"ail_eq_{fd.kind.split(':', 1)[1]}"
+                        if dep not in expanded:
+                            expanded.add(dep)
+                            changed = True
     if expanded & {
         "ail_add_i64",
         "ail_sub_i64",
@@ -784,11 +915,229 @@ def _emit_c_helpers(
                 "",
             ]
         )
-    for ename, edef in enums.items():
-        if f"ail_eq_{ename}" in expanded:
+    if "ail_read_u16_le" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_read_u16_le(const uint8_t* buf, uint64_t idx) {",
+                "    return (uint64_t)buf[idx]",
+                "         | ((uint64_t)buf[idx + UINT64_C(1)] << 8);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_read_u32_le" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_read_u32_le(const uint8_t* buf, uint64_t idx) {",
+                "    return (uint64_t)buf[idx]",
+                "         | ((uint64_t)buf[idx + UINT64_C(1)] << 8)",
+                "         | ((uint64_t)buf[idx + UINT64_C(2)] << 16)",
+                "         | ((uint64_t)buf[idx + UINT64_C(3)] << 24);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_read_u64_le" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_read_u64_le(const uint8_t* buf, uint64_t idx) {",
+                "    return (uint64_t)buf[idx]",
+                "         | ((uint64_t)buf[idx + UINT64_C(1)] << 8)",
+                "         | ((uint64_t)buf[idx + UINT64_C(2)] << 16)",
+                "         | ((uint64_t)buf[idx + UINT64_C(3)] << 24)",
+                "         | ((uint64_t)buf[idx + UINT64_C(4)] << 32)",
+                "         | ((uint64_t)buf[idx + UINT64_C(5)] << 40)",
+                "         | ((uint64_t)buf[idx + UINT64_C(6)] << 48)",
+                "         | ((uint64_t)buf[idx + UINT64_C(7)] << 56);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_write_byte" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_write_byte(uint8_t* buf, uint64_t idx, uint64_t val) {",
+                "    buf[idx] = (uint8_t)val;",
+                "    return UINT64_C(1);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_write_u16_be" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_write_u16_be(uint8_t* buf, uint64_t idx, uint64_t val) {",
+                "    buf[idx] = (uint8_t)(val >> 8);",
+                "    buf[idx + UINT64_C(1)] = (uint8_t)val;",
+                "    return UINT64_C(2);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_write_u16_le" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_write_u16_le(uint8_t* buf, uint64_t idx, uint64_t val) {",
+                "    buf[idx] = (uint8_t)val;",
+                "    buf[idx + UINT64_C(1)] = (uint8_t)(val >> 8);",
+                "    return UINT64_C(2);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_write_u32_be" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_write_u32_be(uint8_t* buf, uint64_t idx, uint64_t val) {",
+                "    buf[idx] = (uint8_t)(val >> 24);",
+                "    buf[idx + UINT64_C(1)] = (uint8_t)(val >> 16);",
+                "    buf[idx + UINT64_C(2)] = (uint8_t)(val >> 8);",
+                "    buf[idx + UINT64_C(3)] = (uint8_t)val;",
+                "    return UINT64_C(4);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_write_u32_le" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_write_u32_le(uint8_t* buf, uint64_t idx, uint64_t val) {",
+                "    buf[idx] = (uint8_t)val;",
+                "    buf[idx + UINT64_C(1)] = (uint8_t)(val >> 8);",
+                "    buf[idx + UINT64_C(2)] = (uint8_t)(val >> 16);",
+                "    buf[idx + UINT64_C(3)] = (uint8_t)(val >> 24);",
+                "    return UINT64_C(4);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_write_u64_be" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_write_u64_be(uint8_t* buf, uint64_t idx, uint64_t val) {",
+                "    buf[idx] = (uint8_t)(val >> 56);",
+                "    buf[idx + UINT64_C(1)] = (uint8_t)(val >> 48);",
+                "    buf[idx + UINT64_C(2)] = (uint8_t)(val >> 40);",
+                "    buf[idx + UINT64_C(3)] = (uint8_t)(val >> 32);",
+                "    buf[idx + UINT64_C(4)] = (uint8_t)(val >> 24);",
+                "    buf[idx + UINT64_C(5)] = (uint8_t)(val >> 16);",
+                "    buf[idx + UINT64_C(6)] = (uint8_t)(val >> 8);",
+                "    buf[idx + UINT64_C(7)] = (uint8_t)val;",
+                "    return UINT64_C(8);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_write_u64_le" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_write_u64_le(uint8_t* buf, uint64_t idx, uint64_t val) {",
+                "    buf[idx] = (uint8_t)val;",
+                "    buf[idx + UINT64_C(1)] = (uint8_t)(val >> 8);",
+                "    buf[idx + UINT64_C(2)] = (uint8_t)(val >> 16);",
+                "    buf[idx + UINT64_C(3)] = (uint8_t)(val >> 24);",
+                "    buf[idx + UINT64_C(4)] = (uint8_t)(val >> 32);",
+                "    buf[idx + UINT64_C(5)] = (uint8_t)(val >> 40);",
+                "    buf[idx + UINT64_C(6)] = (uint8_t)(val >> 48);",
+                "    buf[idx + UINT64_C(7)] = (uint8_t)(val >> 56);",
+                "    return UINT64_C(8);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_mul_div_u64_core" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_mul_div_u64_core(uint64_t a, uint64_t b, uint64_t d, int is_ceil) {",
+                "#if defined(__SIZEOF_INT128__)",
+                "    __extension__ unsigned __int128 num = ((__extension__ (unsigned __int128)a)) * ((__extension__ (unsigned __int128)b));",
+                "    if (is_ceil) {",
+                "        num += (__extension__ (unsigned __int128)(d - UINT64_C(1)));",
+                "    }",
+                "    return (uint64_t)(num / (__extension__ (unsigned __int128)d));",
+                "#else",
+                "    uint64_t a_lo = a & UINT64_C(0xFFFFFFFF);",
+                "    uint64_t a_hi = a >> 32;",
+                "    uint64_t b_lo = b & UINT64_C(0xFFFFFFFF);",
+                "    uint64_t b_hi = b >> 32;",
+                "    uint64_t p0 = a_lo * b_lo;",
+                "    uint64_t p1 = a_lo * b_hi;",
+                "    uint64_t p2 = a_hi * b_lo;",
+                "    uint64_t p3 = a_hi * b_hi;",
+                "    uint64_t mid = (p0 >> 32) + (p1 & UINT64_C(0xFFFFFFFF)) + (p2 & UINT64_C(0xFFFFFFFF));",
+                "    uint64_t lo = (p0 & UINT64_C(0xFFFFFFFF)) | (mid << 32);",
+                "    uint64_t hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);",
+                "    if (is_ceil) {",
+                "        uint64_t nlo = lo + (d - UINT64_C(1));",
+                "        if (nlo < lo) {",
+                "            hi += UINT64_C(1);",
+                "        }",
+                "        lo = nlo;",
+                "    }",
+                "    if (hi == UINT64_C(0)) {",
+                "        return lo / d;",
+                "    }",
+                "    uint64_t rem = hi % d;",
+                "    uint64_t quot = UINT64_C(0);",
+                "    for (uint32_t step = 0U; step < 64U; ++step) {",
+                "        uint64_t msb = rem >> 63;",
+                "        rem = (rem << 1) | (lo >> 63);",
+                "        lo <<= 1;",
+                "        quot <<= 1;",
+                "        if (msb != UINT64_C(0) || rem >= d) {",
+                "            rem -= d;",
+                "            quot |= UINT64_C(1);",
+                "        }",
+                "    }",
+                "    return quot;",
+                "#endif",
+                "}",
+                "",
+            ]
+        )
+    if "ail_mul_div_u64" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_mul_div_u64(uint64_t a, uint64_t b, uint64_t d) {",
+                "    return ail_mul_div_u64_core(a, b, d, 0);",
+                "}",
+                "",
+            ]
+        )
+    if "ail_mul_div_ceil_u64" in expanded:
+        lines.extend(
+            [
+                "static inline uint64_t ail_mul_div_ceil_u64(uint64_t a, uint64_t b, uint64_t d) {",
+                "    return ail_mul_div_u64_core(a, b, d, 1);",
+                "}",
+                "",
+            ]
+        )
+    order = type_order or ([("struct", s) for s in structs] + [("enum", e) for e in enums])
+    for tkind, tname in order:
+        if tkind == "struct" and tname in structs and f"ail_eq_{tname}" in expanded:
+            sdef = structs[tname]
+            parts: list[str] = []
+            for fd in sdef.fields:
+                if fd.kind.startswith(("struct:", "enum:")):
+                    sub_name = fd.kind.split(":", 1)[1]
+                    parts.append(f"ail_eq_{sub_name}(a.{fd.name}, b.{fd.name})")
+                else:
+                    parts.append(f"(a.{fd.name} == b.{fd.name})")
+            cond = " && ".join(parts) if parts else "true"
             lines.extend(
                 [
-                    f"static inline bool ail_eq_{ename}({ename} a, {ename} b) {{",
+                    f"static inline bool ail_eq_{tname}({tname} a, {tname} b) {{",
+                    f"    return {cond};",
+                    "}",
+                    "",
+                ]
+            )
+        elif tkind == "enum" and tname in enums and f"ail_eq_{tname}" in expanded:
+            edef = enums[tname]
+            lines.extend(
+                [
+                    f"static inline bool ail_eq_{tname}({tname} a, {tname} b) {{",
                     "    if (a.tag != b.tag) {",
                     "        return false;",
                     "    }",
@@ -800,8 +1149,12 @@ def _emit_c_helpers(
                 if not vdef.fields:
                     lines.append("            return true;")
                 else:
-                    conds = " && ".join(f"(a._p{i} == b._p{i})" for i in range(len(vdef.fields)))
-                    lines.append(f"            return {conds};")
+                    cur_off = 0
+                    v_conds: list[str] = []
+                    for fd in vdef.fields:
+                        fe, cur_off = _c_slot_eq_expr("a._p", "b._p", cur_off, fd.kind, structs, enums)
+                        v_conds.append(fe)
+                    lines.append(f"            return {' && '.join(v_conds)};")
             lines.extend(["        default:", "            return false;", "    }", "}", ""])
     if uses_fs and "ail_fs_write_u64" in expanded:
         lines.extend(
@@ -867,10 +1220,11 @@ def _generate_c_header_text(
     structs: dict[str, StructDef],
     enums: dict[str, EnumDef],
     uses_atomic: bool,
+    type_order: list[tuple[str, str]] | None = None,
 ) -> str:
     guard = f"AIL_{re.sub(r'[^A-Za-z0-9_]', '_', module_name).upper()}_H"
     lines = [
-        "/* Auto-generated by ailang v1.0 — Formally Verified ISO C11 Header */",
+        "/* Auto-generated by ailang v1.1 — Formally Verified ISO C11 Header */",
         f"#ifndef {guard}",
         f"#define {guard}",
         "",
@@ -887,28 +1241,31 @@ def _generate_c_header_text(
             "",
         ]
     )
-    for sdef in structs.values():
-        lines.append("typedef struct {")
-        if not sdef.fields:
-            lines.append("    uint64_t _dummy;")
-        else:
-            for fd in sdef.fields:
-                ct = "int64_t" if fd.kind == "i64" else "uint64_t"
-                lines.append(f"    {ct} {fd.name};")
-        lines.append(f"}} {sdef.name};")
-        lines.append("")
-    for edef in enums.values():
-        lines.append("typedef enum {")
-        for vdef in edef.variants:
-            lines.append(f"    {edef.name}_{vdef.name} = {vdef.tag},")
-        lines.append(f"}} {edef.name}_Tag;")
-        lines.append("")
-        lines.append("typedef struct {")
-        lines.append("    uint64_t tag;")
-        for p_idx in range(edef.max_fields):
-            lines.append(f"    uint64_t _p{p_idx};")
-        lines.append(f"}} {edef.name};")
-        lines.append("")
+    order = type_order or ([("struct", s) for s in structs] + [("enum", e) for e in enums])
+    for tkind, tname in order:
+        if tkind == "struct" and tname in structs:
+            sdef = structs[tname]
+            lines.append("typedef struct {")
+            if not sdef.fields:
+                lines.append("    uint64_t _dummy;")
+            else:
+                for fd in sdef.fields:
+                    lines.append(f"    {_c_value_type(fd.kind)} {fd.name};")
+            lines.append(f"}} {sdef.name};")
+            lines.append("")
+        elif tkind == "enum" and tname in enums:
+            edef = enums[tname]
+            lines.append("typedef enum {")
+            for vdef in edef.variants:
+                lines.append(f"    {edef.name}_{vdef.name} = {vdef.tag},")
+            lines.append(f"}} {edef.name}_Tag;")
+            lines.append("")
+            lines.append("typedef struct {")
+            lines.append("    uint64_t tag;")
+            for p_idx in range(edef.max_payload_slots(structs, enums)):
+                lines.append(f"    uint64_t _p{p_idx};")
+            lines.append(f"}} {edef.name};")
+            lines.append("")
     for ex in exports:
         p_str = ", ".join(f"{ty} {nm}" for ty, nm in ex.params_c) or "void"
         lines.append(f"{ex.ret_c} {ex.name}({p_str});")
@@ -938,6 +1295,8 @@ def _c_param_decl(
         return f"{base}{restrict}", el
     if pk == "bytes":
         return f"const uint8_t*{restrict}", "u64"
+    if pk == "mut_bytes":
+        return f"uint8_t*{restrict}", "u64"
     if pk == "atomic_u64":
         return "_Atomic uint64_t*", "u64"
     if pk.startswith("struct:"):
@@ -1266,10 +1625,10 @@ def _emit_c_module(
             fn_blocks.append("}")
             fn_blocks.append("")
 
-    if any_bool or any(f"ail_eq_{e}" in used_helpers for e in tenv.enums):
+    if any_bool or any(f"ail_eq_{s}" in used_helpers for s in tenv.structs) or any(f"ail_eq_{e}" in used_helpers for e in tenv.enums):
         any_bool = True
 
-    c_preamble = [f"/* Auto-generated by ailang v1.0 — Verified ISO C11 Module ({module_name}) */"]
+    c_preamble = [f"/* Auto-generated by ailang v1.1 — Verified ISO C11 Module ({module_name}) */"]
     if any_net:
         c_preamble.extend(
             [
@@ -1297,11 +1656,11 @@ def _emit_c_module(
         )
     c_preamble.append("")
 
-    helper_lines = _emit_c_helpers(used_helpers, tenv.enums, any_io, any_fs, any_net)
+    helper_lines = _emit_c_helpers(used_helpers, tenv.structs, tenv.enums, tenv.type_order, any_io, any_fs, any_net)
     if impl_protos:
         impl_protos.append("")
 
-    h_text = _generate_c_header_text(module_name, exports, tenv.structs, tenv.enums, any_atomic)
+    h_text = _generate_c_header_text(module_name, exports, tenv.structs, tenv.enums, any_atomic, tenv.type_order)
     c_text = "\n".join(c_preamble + helper_lines + impl_protos + fn_blocks)
     return h_text, c_text
 

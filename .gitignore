@@ -13,3 +13,7 @@ dist/
 *.pb
 *.log
 .DS_Store
+.mareante/
+site/
+integrations/dogfood-gateway/target/
+*.rlib

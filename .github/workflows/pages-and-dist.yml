@@ -1,0 +1,42 @@
+name: Build Static Studio & Python Distributions
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_pages:
+        description: Upload & deploy standalone Web Studio site to GitHub Pages
+        required: false
+        type: boolean
+        default: false
+jobs:
+  build-dist-and-site:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Sync dependencies
+        run: uv sync --extra dev
+      - name: Export static Web Studio bundle
+        run: uv run ail studio --export-static build/site
+      - name: Build Python sdist and wheel
+        run: uv build --out-dir build/dist
+      - name: Upload Python distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ailang-dist
+          path: build/dist/*
+      - name: Upload static site artifact for GitHub Pages
+        if: ${{ inputs.deploy_pages }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/site
+  deploy-pages:
+    if: ${{ inputs.deploy_pages }}
+    needs: build-dist-and-site
+    runs-on: self-hosted
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

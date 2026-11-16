@@ -1,0 +1,31 @@
+; Verified bidirectional zero-copy wire readers & writers (`stdlib/wire`).
+; Supports mixed big-endian header fields and little-endian sequence/payload encoding.
+
+(fn write_ail_magic ((n u64[4..MAX]) (buf (mut_bytes n)))
+  u64[4..4]
+  (let ((w0 (write_byte buf 0 65))
+        (w1 (write_byte buf 1 73))
+        (w2 (write_byte buf 2 76))
+        (w3 (write_byte buf 3 49)))
+    (+ (+ w0 w1) (+ w2 w3))))
+
+(fn encode_ail_frame_header
+  ((n u64[8..MAX]) (buf (mut_bytes n)) (version u64[0..255]) (flags u64[0..255]) (payload_len u64[0..65535]))
+  u64[8..8]
+  (let ((wm (call write_ail_magic n buf))
+        (wv (write_byte buf 4 version))
+        (wf (write_byte buf 5 flags))
+        (wp (write_u16_be buf 6 payload_len)))
+    (+ wm (+ wv (+ wf wp)))))
+
+(fn read_payload_u32_le ((n u64[12..MAX]) (buf (bytes n)))
+  u64[0..4294967295]
+  (read_u32_le buf 8))
+
+(fn read_payload_u64_le ((n u64[16..MAX]) (buf (bytes n)))
+  u64[0..MAX]
+  (read_u64_le buf 8))
+
+(fn write_payload_u64_le ((n u64[16..MAX]) (buf (mut_bytes n)) (val u64[0..MAX]))
+  u64[8..8]
+  (write_u64_le buf 8 val))

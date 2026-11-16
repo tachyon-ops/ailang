@@ -1,4 +1,4 @@
-"""Unified `ail` v1.0 CLI: Protobuf (`--proto` / `--prototext`), `check`, `audit-spec`, `diff-specs`, `build`, `run`, `repair`, `studio`, `mcp`, `stdlib`."""
+"""Unified `ail` v1.1 CLI: Protobuf (`--proto` / `--prototext`), `check`, `audit-spec`, `diff-specs`, `build`, `run`, `repair`, `fuzz`, `studio`, `mcp`, `stdlib`."""
 
 from __future__ import annotations
 import argparse
@@ -130,7 +130,7 @@ def _format_stdlib_catalog(module_filter: str | None = None) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ail",
-        description="AIL v1.0: Protobuf-Native Formally Verified AI Agent Language & Multi-Target Compiler Toolchain",
+        description="AIL v1.1: Protobuf-Native Formally Verified AI Agent Language & Multi-Target Compiler Toolchain",
     )
     parser.add_argument(
         "--format",
@@ -194,9 +194,22 @@ def main(argv: list[str] | None = None) -> int:
     p_studio.add_argument(
         "--regenerate-demos",
         action="store_true",
-        help="Regenerate static `web/demos.json` bundle from v1.0 backends and exit",
+        help="Regenerate static `web/demos.json` bundle from v1.1 backends and exit",
+    )
+    p_studio.add_argument(
+        "--export-static",
+        type=Path,
+        default=None,
+        help="Export standalone static Web Studio site (HTML/CSS/JS + demos.json) to directory and exit",
     )
     p_studio.add_argument("--out", type=Path, default=None, help="Optional output path for `--regenerate-demos`")
+
+    p_fuzz = sub.add_parser("fuzz", help="Run 4-target differential fuzzing (Native vs WASM vs C11 vs Rust)")
+    p_fuzz.add_argument("input", type=Path, help="Input .ail module path")
+    p_fuzz.add_argument("-o", "--out-dir", type=Path, default=None, help="Output directory for build/fuzz artifacts")
+    p_fuzz.add_argument("--cases", type=int, default=40, help="Valid randomized + boundary cases per exported fn (default: 40)")
+    p_fuzz.add_argument("--seed", type=int, default=42, help="Deterministic PRNG seed (default: 42)")
+    p_fuzz.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON differential fuzzing report")
 
     sub.add_parser("mcp", help="Launch the AIL Model Context Protocol (MCP) JSON-RPC 2.0 stdio server")
 
@@ -348,8 +361,18 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_repair_session(sess, args.format, args.proto_out)
 
     if args.cmd == "studio":
-        from ailang.web_server import DEFAULT_WEB_DIR, generate_static_demos, serve_studio
+        from ailang.web_server import DEFAULT_WEB_DIR, export_static_site, generate_static_demos, serve_studio
 
+        if args.export_static is not None:
+            payload = export_static_site(args.export_static)
+            if args.format == "human":
+                print(
+                    f"[EXPORTED-SITE] {args.export_static} ({len(payload.get('presets', []))} presets, "
+                    f"targets={','.join(payload.get('targets', []))})"
+                )
+            elif args.format in ("proto", "prototext") or args.proto_out:
+                _emit_response(pb.CompilerResponse(status=pb.STATUS_VERIFIED), args.format, args.proto_out)
+            return 0
         if args.regenerate_demos:
             target_path = args.out or (DEFAULT_WEB_DIR / "demos.json")
             payload = generate_static_demos(out_path=target_path)
@@ -363,6 +386,39 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         serve_studio(host=args.host, port=args.port)
         return 0
+
+    if args.cmd == "fuzz":
+        import json as _json
+        import tempfile
+        from ailang.diff_fuzz import run_differential_fuzz
+
+        if args.out_dir is not None:
+            report = run_differential_fuzz(args.input, args.out_dir, cases=args.cases, seed=args.seed)
+        else:
+            with tempfile.TemporaryDirectory(prefix="ail_fuzz_") as tmp_dir:
+                report = run_differential_fuzz(args.input, Path(tmp_dir), cases=args.cases, seed=args.seed)
+        if args.as_json:
+            print(_json.dumps(report.to_dict(), indent=2))
+        else:
+            status_tag = "DIFF_FUZZ_PASS" if report.mismatches == 0 else "DIFF_FUZZ_FAIL"
+            lines = [
+                f"[{status_tag}] module={report.stem} seed={report.seed} "
+                f"executions={report.total_executions} mismatches={report.mismatches} "
+                f"elapsed={report.elapsed_ms:.2f} ms"
+            ]
+            for fn_s in report.functions:
+                if fn_s.skipped_reason:
+                    lines.append(f"  [SKIP] {fn_s.fn_name}: {fn_s.skipped_reason}")
+                else:
+                    lines.append(
+                        f"  [{'OK' if fn_s.mismatches == 0 else 'MISMATCH'}] "
+                        f"{fn_s.fn_name}: cases={fn_s.cases_executed} mismatches={fn_s.mismatches}"
+                    )
+            if args.format in ("proto", "prototext") or args.proto_out:
+                st = pb.STATUS_VERIFIED if report.mismatches == 0 else pb.STATUS_REJECTED
+                return _emit_response(pb.CompilerResponse(status=st), args.format, args.proto_out)
+            print("\n".join(lines))
+        return 0 if report.mismatches == 0 else 1
 
     if args.cmd == "mcp":
         from ailang.mcp_server import main as mcp_main

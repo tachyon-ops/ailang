@@ -26,3 +26,11 @@
     (== out (/ (* (- (field q ask) (field q bid)) 10000) (field q bid))))
   (let ((b (field q bid)) (a (field q ask)))
     (/ (* (- a b) 10000) b)))
+
+(fn mul_bps_wide_u64 ((amount u64[0..MAX]) (bps u64[0..10000]))
+  (out u64[0..amount] (== out (mul_div_u64 amount bps 10000)))
+  (mul_div_u64 amount bps 10000))
+
+(fn mul_bps_ceil_u64 ((amount u64[0..MAX]) (bps u64[0..10000]))
+  (out u64[0..amount] (== out (mul_div_ceil_u64 amount bps 10000)))
+  (mul_div_ceil_u64 amount bps 10000))

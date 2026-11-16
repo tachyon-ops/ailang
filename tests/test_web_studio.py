@@ -166,7 +166,7 @@ def test_studio_static_routes_and_security(studio_server: str) -> None:
     status, headers, body = _http_get(studio_server, "/")
     assert status == 200
     assert "text/html" in headers.get("Content-Type", "")
-    assert b"AIL v1.0 Web Studio" in body
+    assert b"AIL v1.1 Web Studio" in body
 
     for path, expected_ct in (
         ("/styles.css", "text/css"),
@@ -185,7 +185,7 @@ def test_studio_health_and_presets(studio_server: str) -> None:
     assert st == 200
     health = json.loads(body.decode("utf-8"))
     assert health["ok"] is True
-    assert health["version"] == "1.0.0"
+    assert health["version"] == "1.1.0"
     assert "llvm" in health["targets"]
 
     st_p, _, body_p = _http_get(studio_server, "/api/presets")
@@ -200,6 +200,7 @@ def test_studio_health_and_presets(studio_server: str) -> None:
         "wire_frame_parser",
         "simd_halving",
         "broken_agent_draft",
+        "wire_codec_v1_1",
     ]
     sum_preset = next(p for p in data["presets"] if p["id"] == "sum_type_settlement")
     assert sum_preset["sample_call"] == {"fn": "outcome_notional", "args": ["0,250,4000"]}
@@ -297,8 +298,8 @@ def test_generate_static_demos_and_validate_wasm(tmp_path: Path) -> None:
     demos = generate_static_demos(out_file)
     assert out_file.exists()
     loaded = json.loads(out_file.read_text(encoding="utf-8"))
-    assert loaded["version"] == "1.0.0"
-    assert len(loaded["presets"]) == 6
+    assert loaded["version"] == "1.1.0"
+    assert len(loaded["presets"]) == 7
 
     broken = next(p for p in loaded["presets"] if p["id"] == "broken_agent_draft")
     assert broken["compile"]["verified"] is False

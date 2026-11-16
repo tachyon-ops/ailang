@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/ail_gateway_kernel",
+    "crates/gateway_service",
+]
+resolver = "2"

@@ -30,3 +30,11 @@
 (fn div_ceil_u64 ((a u64[0..MAX]) (b u64[1..MAX]))
   (out u64[0..MAX] (== out (if (== a 0) 0 (+ 1 (/ (- a 1) b)))))
   (if (== a 0) 0 (+ 1 (/ (- a 1) b))))
+
+(fn wide_mul_div_floor ((a u64[0..MAX]) (b u64[0..MAX]) (denom u64[(max b 1)..MAX]))
+  (out u64[0..a] (== out (mul_div_u64 a b denom)))
+  (mul_div_u64 a b denom))
+
+(fn wide_mul_div_ceil ((a u64[0..MAX]) (b u64[0..MAX]) (denom u64[(max b 1)..MAX]))
+  (out u64[0..a] (== out (mul_div_ceil_u64 a b denom)))
+  (mul_div_ceil_u64 a b denom))

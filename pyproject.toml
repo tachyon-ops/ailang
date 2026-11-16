@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ailang"
-version = "1.0.0"
+version = "1.1.0"
 description = "AIL: AI-Native Formally Verified Programming Language — Protobuf AST, Z3/Bitwuzla Proofs, SpecMut Firewall & Multi-Target LLVM/WASM/C11/Rust Compiler"
 readme = "README.md"
 license = { text = "MIT" }

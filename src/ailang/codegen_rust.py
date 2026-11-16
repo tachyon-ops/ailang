@@ -124,6 +124,8 @@ def _rust_type_for_kind(kind: str, is_i64_slice: bool = False) -> str:
         return "bool"
     if kind == "bytes":
         return "&[u8]"
+    if kind == "mut_bytes":
+        return "&mut [u8]"
     if kind == "slice":
         return "&[i64]" if is_i64_slice else "&[u64]"
     if kind == "mut_slice":
@@ -277,7 +279,25 @@ class RustExprEmitter:
         if op == "get":
             bname = str(items[1].val)
             return "i64" if bname in self.slice_i64_vars else "u64"
-        if op in ("byte_at", "read_u16_be", "read_u32_be", "read_u64_be", "bytes_eq4"):
+        if op in (
+            "byte_at",
+            "read_u16_be",
+            "read_u32_be",
+            "read_u64_be",
+            "read_u16_le",
+            "read_u32_le",
+            "read_u64_le",
+            "bytes_eq4",
+            "write_byte",
+            "write_u16_be",
+            "write_u32_be",
+            "write_u64_be",
+            "write_u16_le",
+            "write_u32_le",
+            "write_u64_le",
+            "mul_div_u64",
+            "mul_div_ceil_u64",
+        ):
             return "u64"
         if op == "fold":
             acc_t = items[2].val[2].raw()
@@ -535,33 +555,29 @@ class RustExprEmitter:
             self.used_helpers.add("slice_get_u64")
             return f"ail_slice_get_u64({buf_rs}, {idx_s})", True
 
-        if op == "byte_at":
-            self.used_helpers.add("byte_at")
-            buf_s, _ = self.emit_expr(items[1], "bytes", indent)
+        if op in ("byte_at", "read_u16_be", "read_u32_be", "read_u64_be", "read_u16_le", "read_u32_le", "read_u64_le"):
+            self.used_helpers.add(op)
+            buf_s = self._emit_bytes_read_arg(items[1], indent)
             idx_s, _ = self.emit_expr(items[2], "u64", indent)
-            return f"ail_byte_at({buf_s}, {idx_s})", True
+            return f"ail_{op}({buf_s}, {idx_s})", True
 
-        if op == "read_u16_be":
-            self.used_helpers.add("read_u16_be")
-            buf_s, _ = self.emit_expr(items[1], "bytes", indent)
+        if op in ("write_byte", "write_u16_be", "write_u32_be", "write_u64_be", "write_u16_le", "write_u32_le", "write_u64_le"):
+            self.used_helpers.add(op)
+            buf_rs = _rust_ident(str(items[1].val))
             idx_s, _ = self.emit_expr(items[2], "u64", indent)
-            return f"ail_read_u16_be({buf_s}, {idx_s})", True
+            val_s, _ = self.emit_expr(items[3], "u64", indent)
+            return f"ail_{op}(&mut *{buf_rs}, {idx_s}, {val_s})", True
 
-        if op == "read_u32_be":
-            self.used_helpers.add("read_u32_be")
-            buf_s, _ = self.emit_expr(items[1], "bytes", indent)
-            idx_s, _ = self.emit_expr(items[2], "u64", indent)
-            return f"ail_read_u32_be({buf_s}, {idx_s})", True
-
-        if op == "read_u64_be":
-            self.used_helpers.add("read_u64_be")
-            buf_s, _ = self.emit_expr(items[1], "bytes", indent)
-            idx_s, _ = self.emit_expr(items[2], "u64", indent)
-            return f"ail_read_u64_be({buf_s}, {idx_s})", True
+        if op in ("mul_div_u64", "mul_div_ceil_u64"):
+            self.used_helpers.add(op)
+            a_s, _ = self.emit_expr(items[1], "u64", indent)
+            b_s, _ = self.emit_expr(items[2], "u64", indent)
+            d_s, _ = self.emit_expr(items[3], "u64", indent)
+            return f"ail_{op}({a_s}, {b_s}, {d_s})", True
 
         if op == "bytes_eq4":
             self.used_helpers.add("bytes_eq4")
-            buf_s, _ = self.emit_expr(items[1], "bytes", indent)
+            buf_s = self._emit_bytes_read_arg(items[1], indent)
             idx_s, _ = self.emit_expr(items[2], "u64", indent)
             b_args: list[str] = []
             for b_node in items[3:7]:
@@ -627,6 +643,10 @@ class RustExprEmitter:
                 if pk == "slice" and isinstance(arg_node.val, str) and self.var_kinds.get(arg_node.val) == "mut_slice":
                     call_args.append(f"&*{_rust_ident(arg_node.val)}")
                 elif pk == "mut_slice" and isinstance(arg_node.val, str):
+                    call_args.append(f"&mut *{_rust_ident(arg_node.val)}")
+                elif pk == "bytes" and isinstance(arg_node.val, str) and self.var_kinds.get(arg_node.val) == "mut_bytes":
+                    call_args.append(f"&*{_rust_ident(arg_node.val)}")
+                elif pk == "mut_bytes" and isinstance(arg_node.val, str):
                     call_args.append(f"&mut *{_rust_ident(arg_node.val)}")
                 else:
                     arg_indent = inner_indent if cap_prefixes else indent
@@ -701,6 +721,12 @@ class RustExprEmitter:
             node.span,
             pretty(node),
         )
+
+    def _emit_bytes_read_arg(self, arg_node: SNode, indent: str) -> str:
+        if isinstance(arg_node.val, str) and self.var_kinds.get(arg_node.val) == "mut_bytes":
+            return f"&*{_rust_ident(arg_node.val)}"
+        buf_s, _ = self.emit_expr(arg_node, "bytes", indent)
+        return buf_s
 
     @staticmethod
     def _block_or_stmt(stmts: list[str], tail: str | None, indent: str) -> str:
@@ -814,6 +840,75 @@ def _emit_rust_helpers(used: set[str]) -> list[str]:
             "    0\n"
             "}\n"
         )
+    for width, bits in (("u16", 2), ("u32", 4), ("u64", 8)):
+        op_le = f"read_{width}_le"
+        if op_le in used:
+            conv = f"{width}::from_le_bytes(arr) as u64" if width != "u64" else "u64::from_le_bytes(arr)"
+            helpers.append(
+                f"#[inline]\n"
+                f"fn ail_{op_le}(buf: &[u8], idx: u64) -> u64 {{\n"
+                f"    if let Ok(i) = usize::try_from(idx) {{\n"
+                f"        if let Some(end) = i.checked_add({bits}) {{\n"
+                f"            if let Some(sub) = buf.get(i..end) {{\n"
+                f"                if let Ok(arr) = <[u8; {bits}]>::try_from(sub) {{\n"
+                f"                    return {conv};\n"
+                f"                }}\n"
+                f"            }}\n"
+                f"        }}\n"
+                f"    }}\n"
+                f"    0\n"
+                f"}}\n"
+            )
+    if "write_byte" in used:
+        helpers.append(
+            "#[inline]\n"
+            "fn ail_write_byte(buf: &mut [u8], idx: u64, val: u64) -> u64 {\n"
+            "    if let Ok(i) = usize::try_from(idx) {\n"
+            "        if let Some(slot) = buf.get_mut(i) {\n"
+            "            *slot = (val & 0xFF) as u8;\n"
+            "        }\n"
+            "    }\n"
+            "    1\n"
+            "}\n"
+        )
+    for width, nbytes in (("u16", 2), ("u32", 4), ("u64", 8)):
+        for endian, conv_fn in (("be", "to_be_bytes"), ("le", "to_le_bytes")):
+            op_w = f"write_{width}_{endian}"
+            if op_w in used:
+                helpers.append(
+                    f"#[inline]\n"
+                    f"fn ail_{op_w}(buf: &mut [u8], idx: u64, val: u64) -> u64 {{\n"
+                    f"    if let Ok(i) = usize::try_from(idx) {{\n"
+                    f"        if let Some(end) = i.checked_add({nbytes}) {{\n"
+                    f"            if let Some(sub) = buf.get_mut(i..end) {{\n"
+                    f"                sub.copy_from_slice(&((val as {width}).{conv_fn}()));\n"
+                    f"            }}\n"
+                    f"        }}\n"
+                    f"    }}\n"
+                    f"    {nbytes}\n"
+                    f"}}\n"
+                )
+    if "mul_div_u64" in used:
+        helpers.append(
+            "#[inline]\n"
+            "fn ail_mul_div_u64(a: u64, b: u64, d: u64) -> u64 {\n"
+            "    if d == 0 {\n"
+            "        return 0;\n"
+            "    }\n"
+            "    (((a as u128) * (b as u128)) / (d as u128)) as u64\n"
+            "}\n"
+        )
+    if "mul_div_ceil_u64" in used:
+        helpers.append(
+            "#[inline]\n"
+            "fn ail_mul_div_ceil_u64(a: u64, b: u64, d: u64) -> u64 {\n"
+            "    if d == 0 {\n"
+            "        return 0;\n"
+            "    }\n"
+            "    let d128 = d as u128;\n"
+            "    ((((a as u128) * (b as u128)) + (d128 - 1)) / d128) as u64\n"
+            "}\n"
+        )
     return helpers
 
 
@@ -832,34 +927,38 @@ def emit_rust_source(forms: list[SNode], tenv: ModuleTypeEnv) -> str:
     cap_fns = _compute_cap_functions(forms, tenv)
     used_helpers: set[str] = set()
 
-    struct_blocks: list[str] = []
-    for sdef in tenv.structs.values():
-        fields_rs = [
-            f"    pub {_rust_ident(fd.name)}: {'i64' if fd.kind == 'i64' else 'u64'},"
-            for fd in sdef.fields
-        ]
-        struct_blocks.append(
-            "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
-            f"pub struct {_rust_ident(sdef.name)} {{\n"
-            + "\n".join(fields_rs)
-            + "\n}\n"
-        )
-
-    enum_blocks: list[str] = []
-    for edef in tenv.enums.values():
-        variants_rs: list[str] = []
-        for vdef in edef.variants:
-            if not vdef.fields:
-                variants_rs.append(f"    {_rust_ident(vdef.name)},")
-            else:
-                ftypes = ", ".join("i64" if fd.kind == "i64" else "u64" for fd in vdef.fields)
-                variants_rs.append(f"    {_rust_ident(vdef.name)}({ftypes}),")
-        enum_blocks.append(
-            "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
-            f"pub enum {_rust_ident(edef.name)} {{\n"
-            + "\n".join(variants_rs)
-            + "\n}\n"
-        )
+    type_order = tenv.type_order or (
+        [("struct", s) for s in tenv.structs] + [("enum", e) for e in tenv.enums]
+    )
+    type_blocks: list[str] = []
+    for tkind, tname in type_order:
+        if tkind == "struct" and tname in tenv.structs:
+            sdef = tenv.structs[tname]
+            fields_rs = [
+                f"    pub {_rust_ident(fd.name)}: {_rust_type_for_kind(fd.kind)},"
+                for fd in sdef.fields
+            ]
+            type_blocks.append(
+                "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
+                f"pub struct {_rust_ident(sdef.name)} {{\n"
+                + "\n".join(fields_rs)
+                + "\n}\n"
+            )
+        elif tkind == "enum" and tname in tenv.enums:
+            edef = tenv.enums[tname]
+            variants_rs: list[str] = []
+            for vdef in edef.variants:
+                if not vdef.fields:
+                    variants_rs.append(f"    {_rust_ident(vdef.name)},")
+                else:
+                    ftypes = ", ".join(_rust_type_for_kind(fd.kind) for fd in vdef.fields)
+                    variants_rs.append(f"    {_rust_ident(vdef.name)}({ftypes}),")
+            type_blocks.append(
+                "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
+                f"pub enum {_rust_ident(edef.name)} {{\n"
+                + "\n".join(variants_rs)
+                + "\n}\n"
+            )
 
     # Collect atomic_protocol step transitions: (pname, sname) -> (f0_name, sparam_specs, next_f0_node)
     proto_steps: dict[tuple[str, str], tuple[str, list[tuple[str, str, SNode, SNode]], SNode]] = {}
@@ -1060,8 +1159,7 @@ def emit_rust_source(forms: list[SNode], tenv: ModuleTypeEnv) -> str:
         )
 
     sections.extend(_emit_rust_helpers(used_helpers))
-    sections.extend(struct_blocks)
-    sections.extend(enum_blocks)
+    sections.extend(type_blocks)
     sections.extend(fn_blocks)
     return "\n".join(sections).rstrip() + "\n"
 

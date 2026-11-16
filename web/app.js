@@ -446,6 +446,8 @@
         input.value = String(sampleArgs[idx]);
       } else if (param.kind === "bytes") {
         input.value = "65,73,76,49,0,1,0,16";
+      } else if (param.kind === "mut_bytes") {
+        input.value = "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0";
       } else if (param.kind === "slice" || param.kind === "mut_slice") {
         input.value = "100,200,300,400";
       } else if (param.kind.startsWith("struct:")) {
@@ -528,13 +530,23 @@
       for (let i = 0; i < runtimeParams.length; i += 1) {
         const p = runtimeParams[i];
         const rawVal = argInputs[i]?.value ?? "0";
-        if (p.kind === "bytes" && memory) {
+        if ((p.kind === "bytes" || p.kind === "mut_bytes") && memory) {
           const bytes = parseByteList(rawVal);
           const ptr = bytes.length === 0 ? 0 : allocMem(bytes.length);
           if (bytes.length > 0) {
             new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
           }
           callArgs.push(ptr);
+          if (p.kind === "mut_bytes" && bytes.length > 0) {
+            const logEl = $("#wasm-host-log");
+            queueMicrotask(() => {
+              if (!logEl) return;
+              const out = Array.from(new Uint8Array(memory.buffer, ptr, bytes.length));
+              const hex = out.map((b) => b.toString(16).padStart(2, "0")).join(" ");
+              logEl.hidden = false;
+              logEl.textContent = (logEl.textContent ? logEl.textContent + "\n" : "") + `[mut_bytes ${p.name} (${out.length}B)]\nhex: ${hex}\ndec: ${out.join(",")}`;
+            });
+          }
         } else if ((p.kind === "slice" || p.kind === "mut_slice") && memory) {
           const vals = rawVal
             .split(",")

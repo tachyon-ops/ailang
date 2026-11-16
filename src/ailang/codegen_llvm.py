@@ -8,7 +8,15 @@ import subprocess
 
 from ailang import ail_agent_pb2 as pb
 from ailang.diagnostics import I64_MAX, I64_MIN, U64_MAX
-from ailang.ownership import EnumDef, LINEAR_CAPS, FnSig, ModuleTypeEnv, StructDef, check_module_ownership_v2
+from ailang.ownership import (
+    EnumDef,
+    LINEAR_CAPS,
+    FnSig,
+    ModuleTypeEnv,
+    StructDef,
+    check_module_ownership_v2,
+    kind_u64_slots,
+)
 from ailang.parser import SNode
 
 
@@ -86,6 +94,126 @@ class FunctionIREmitter:
         rk = self._raw_kind(node)
         return "u64" if rk == "lit_pos" else rk
 
+    def _flatten_to_i64_regs(self, reg: str, kind: str) -> list[str]:
+        if kind in ("u64", "i64"):
+            return [reg]
+        if kind.startswith("struct:"):
+            sname = kind.split(":", 1)[1]
+            sdef = self.tenv.structs[sname]
+            out: list[str] = []
+            for fidx, fd in enumerate(sdef.fields):
+                freg = self.tmp()
+                self.lines.append(f"  {freg} = extractvalue %struct.{sname} {reg}, {fidx}")
+                out.extend(self._flatten_to_i64_regs(freg, fd.kind))
+            return out or ["0"]
+        if kind.startswith("enum:"):
+            ename = kind.split(":", 1)[1]
+            edef = self.tenv.enums[ename]
+            nslots = 1 + edef.max_payload_slots(self.tenv.structs, self.tenv.enums)
+            out = []
+            for sidx in range(nslots):
+                sreg = self.tmp()
+                self.lines.append(f"  {sreg} = extractvalue %enum.{ename} {reg}, {sidx}")
+                out.append(sreg)
+            return out
+        return [reg]
+
+    def _unflatten_from_i64_regs(self, regs: list[str], kind: str, offset: int = 0) -> tuple[str, int]:
+        if kind in ("u64", "i64"):
+            return regs[offset], offset + 1
+        if kind.startswith("struct:"):
+            sname = kind.split(":", 1)[1]
+            sdef = self.tenv.structs[sname]
+            ir_sty = f"%struct.{sname}"
+            cur_agg = "poison"
+            cur_off = offset
+            for fidx, fd in enumerate(sdef.fields):
+                freg, cur_off = self._unflatten_from_i64_regs(regs, fd.kind, cur_off)
+                nxt = self.tmp()
+                self.lines.append(f"  {nxt} = insertvalue {ir_sty} {cur_agg}, {_ir_type_for_kind(fd.kind)} {freg}, {fidx}")
+                cur_agg = nxt
+            return cur_agg, cur_off
+        if kind.startswith("enum:"):
+            ename = kind.split(":", 1)[1]
+            edef = self.tenv.enums[ename]
+            ir_ety = f"%enum.{ename}"
+            nslots = 1 + edef.max_payload_slots(self.tenv.structs, self.tenv.enums)
+            cur_agg = "poison"
+            for sidx in range(nslots):
+                nxt = self.tmp()
+                self.lines.append(f"  {nxt} = insertvalue {ir_ety} {cur_agg}, i64 {regs[offset + sidx]}, {sidx}")
+                cur_agg = nxt
+            return cur_agg, offset + nslots
+        return regs[offset], offset + 1
+
+    def _emit_aggregate_eq(self, a_reg: str, b_reg: str, kind: str) -> str:
+        if kind in ("u64", "i64"):
+            r = self.tmp()
+            self.lines.append(f"  {r} = icmp eq i64 {a_reg}, {b_reg}")
+            return r
+        if kind.startswith("struct:"):
+            sname = kind.split(":", 1)[1]
+            sdef = self.tenv.structs[sname]
+            ir_sty = f"%struct.{sname}"
+            acc = "true"
+            for fidx, fd in enumerate(sdef.fields):
+                fa = self.tmp()
+                fb = self.tmp()
+                self.lines.append(f"  {fa} = extractvalue {ir_sty} {a_reg}, {fidx}")
+                self.lines.append(f"  {fb} = extractvalue {ir_sty} {b_reg}, {fidx}")
+                feq = self._emit_aggregate_eq(fa, fb, fd.kind)
+                if acc == "true":
+                    acc = feq
+                else:
+                    nxt = self.tmp()
+                    self.lines.append(f"  {nxt} = and i1 {acc}, {feq}")
+                    acc = nxt
+            return acc
+        if kind.startswith("enum:"):
+            ename = kind.split(":", 1)[1]
+            edef = self.tenv.enums[ename]
+            ir_ety = f"%enum.{ename}"
+            nslots = 1 + edef.max_payload_slots(self.tenv.structs, self.tenv.enums)
+            slots_a = []
+            slots_b = []
+            for sidx in range(nslots):
+                sa = self.tmp()
+                sb = self.tmp()
+                self.lines.append(f"  {sa} = extractvalue {ir_ety} {a_reg}, {sidx}")
+                self.lines.append(f"  {sb} = extractvalue {ir_ety} {b_reg}, {sidx}")
+                slots_a.append(sa)
+                slots_b.append(sb)
+            acc = self.tmp()
+            self.lines.append(f"  {acc} = icmp eq i64 {slots_a[0]}, {slots_b[0]}")
+            for vdef in edef.variants:
+                if not vdef.fields:
+                    continue
+                tag_ne = self.tmp()
+                self.lines.append(f"  {tag_ne} = icmp ne i64 {slots_a[0]}, {vdef.tag}")
+                cur_off = 1
+                veq = "true"
+                for fd in vdef.fields:
+                    needed = kind_u64_slots(fd.kind, self.tenv.structs, self.tenv.enums)
+                    fa, _ = self._unflatten_from_i64_regs(slots_a[cur_off : cur_off + needed], fd.kind, 0)
+                    fb, _ = self._unflatten_from_i64_regs(slots_b[cur_off : cur_off + needed], fd.kind, 0)
+                    cur_off += needed
+                    feq = self._emit_aggregate_eq(fa, fb, fd.kind)
+                    if veq == "true":
+                        veq = feq
+                    else:
+                        nv = self.tmp()
+                        self.lines.append(f"  {nv} = and i1 {veq}, {feq}")
+                        veq = nv
+                v_ok = self.tmp()
+                self.lines.append(f"  {v_ok} = or i1 {tag_ne}, {veq}")
+                nxt = self.tmp()
+                self.lines.append(f"  {nxt} = and i1 {acc}, {v_ok}")
+                acc = nxt
+            return acc
+        r = self.tmp()
+        self.lines.append(f"  {r} = icmp eq i64 {a_reg}, {b_reg}")
+        return r
+
     def emit_expr(self, node: SNode, env: dict[str, str]) -> str:
         if isinstance(node.val, int):
             return str(node.val)
@@ -143,12 +271,14 @@ class FunctionIREmitter:
 
         if op == "make":
             sname = str(items[1].val)
+            sdef = self.tenv.structs[sname]
             ir_sty = f"%struct.{sname}"
             cur_agg = "poison"
-            for idx, arg_n in enumerate(items[2:]):
+            for idx, (fd, arg_n) in enumerate(zip(sdef.fields, items[2:])):
                 fval = self.emit_expr(arg_n, env)
+                fty = _ir_type_for_kind(fd.kind)
                 nxt = self.tmp()
-                self.lines.append(f"  {nxt} = insertvalue {ir_sty} {cur_agg}, i64 {fval}, {idx}")
+                self.lines.append(f"  {nxt} = insertvalue {ir_sty} {cur_agg}, {fty} {fval}, {idx}")
                 cur_agg = nxt
             return cur_agg
 
@@ -173,11 +303,14 @@ class FunctionIREmitter:
             ir_ety = f"%enum.{ename}"
             cur_agg = self.tmp()
             self.lines.append(f"  {cur_agg} = insertvalue {ir_ety} zeroinitializer, i64 {vdef.tag}, 0")
-            for idx, arg_n in enumerate(items[3:]):
+            slot_idx = 1
+            for fd, arg_n in zip(vdef.fields, items[3:]):
                 fval = self.emit_expr(arg_n, env)
-                nxt = self.tmp()
-                self.lines.append(f"  {nxt} = insertvalue {ir_ety} {cur_agg}, i64 {fval}, {idx + 1}")
-                cur_agg = nxt
+                for reg in self._flatten_to_i64_regs(fval, fd.kind):
+                    nxt = self.tmp()
+                    self.lines.append(f"  {nxt} = insertvalue {ir_ety} {cur_agg}, i64 {reg}, {slot_idx}")
+                    cur_agg = nxt
+                    slot_idx += 1
             return cur_agg
 
         if op == "is_variant":
@@ -222,12 +355,19 @@ class FunctionIREmitter:
                 if not (isinstance(pat.val, str) and pat.val == "_"):
                     vdef = edef.get_variant(str(pat.val[0].val))
                     assert vdef is not None
-                    for fidx, (bnode, fd) in enumerate(zip(pat.val[1:], vdef.fields)):
+                    slot_offset = 1
+                    for bnode, fd in zip(pat.val[1:], vdef.fields):
                         bname = str(bnode.val)
                         self.var_kinds[bname] = fd.kind
-                        freg = self.tmp()
-                        self.lines.append(f"  {freg} = extractvalue {ir_ety} {sreg}, {fidx + 1}")
-                        arm_env[bname] = freg
+                        needed = kind_u64_slots(fd.kind, self.tenv.structs, self.tenv.enums)
+                        slot_regs: list[str] = []
+                        for sidx in range(slot_offset, slot_offset + needed):
+                            freg = self.tmp()
+                            self.lines.append(f"  {freg} = extractvalue {ir_ety} {sreg}, {sidx}")
+                            slot_regs.append(freg)
+                        slot_offset += needed
+                        val_reg, _ = self._unflatten_from_i64_regs(slot_regs, fd.kind, 0)
+                        arm_env[bname] = val_reg
                 av = self.emit_expr(arm_body, arm_env)
                 aend = self.cur_block
                 arm_results.append((av, aend))
@@ -329,6 +469,78 @@ class FunctionIREmitter:
                 return val
             return swapped
 
+        if op in ("read_u16_le", "read_u32_le", "read_u64_le"):
+            buf_name = str(items[1].val)
+            idx = self.emit_expr(items[2], env)
+            width_bits = {"read_u16_le": 16, "read_u32_le": 32, "read_u64_le": 64}[op]
+            ty = f"i{width_bits}"
+            ptr = self.tmp()
+            raw = self.tmp()
+            self.lines.append(f"  {ptr} = getelementptr inbounds nuw i8, ptr {env[buf_name]}, i64 {idx}")
+            self.lines.append(f"  {raw} = load {ty}, ptr {ptr}, align 1")
+            if width_bits < 64:
+                val = self.tmp()
+                self.lines.append(f"  {val} = zext {ty} {raw} to i64")
+                return val
+            return raw
+
+        if op == "write_byte":
+            buf_name = str(items[1].val)
+            idx = self.emit_expr(items[2], env)
+            v = self.emit_expr(items[3], env)
+            ptr = self.tmp()
+            b8 = self.tmp()
+            self.lines.append(f"  {ptr} = getelementptr inbounds nuw i8, ptr {env[buf_name]}, i64 {idx}")
+            self.lines.append(f"  {b8} = trunc i64 {v} to i8")
+            self.lines.append(f"  store i8 {b8}, ptr {ptr}, align 1")
+            return "1"
+
+        if op in ("write_u16_be", "write_u32_be", "write_u64_be", "write_u16_le", "write_u32_le", "write_u64_le"):
+            buf_name = str(items[1].val)
+            idx = self.emit_expr(items[2], env)
+            v = self.emit_expr(items[3], env)
+            width_bytes = 2 if "u16" in op else (4 if "u32" in op else 8)
+            width_bits = width_bytes * 8
+            ty = f"i{width_bits}"
+            ptr = self.tmp()
+            self.lines.append(f"  {ptr} = getelementptr inbounds nuw i8, ptr {env[buf_name]}, i64 {idx}")
+            if width_bits < 64:
+                narrow = self.tmp()
+                self.lines.append(f"  {narrow} = trunc i64 {v} to {ty}")
+            else:
+                narrow = v
+            if op.endswith("_be"):
+                out_v = self.tmp()
+                self.lines.append(f"  {out_v} = call {ty} @llvm.bswap.{ty}({ty} {narrow})")
+            else:
+                out_v = narrow
+            self.lines.append(f"  store {ty} {out_v}, ptr {ptr}, align 1")
+            return str(width_bytes)
+
+        if op in ("mul_div_u64", "mul_div_ceil_u64"):
+            a = self.emit_expr(items[1], env)
+            b = self.emit_expr(items[2], env)
+            d = self.emit_expr(items[3], env)
+            a128 = self.tmp()
+            b128 = self.tmp()
+            d128 = self.tmp()
+            prod = self.tmp()
+            self.lines.append(f"  {a128} = zext i64 {a} to i128")
+            self.lines.append(f"  {b128} = zext i64 {b} to i128")
+            self.lines.append(f"  {d128} = zext i64 {d} to i128")
+            self.lines.append(f"  {prod} = mul nuw i128 {a128}, {b128}")
+            num = prod
+            if op == "mul_div_ceil_u64":
+                dm1 = self.tmp()
+                num = self.tmp()
+                self.lines.append(f"  {dm1} = sub nuw i128 {d128}, 1")
+                self.lines.append(f"  {num} = add nuw i128 {prod}, {dm1}")
+            quot = self.tmp()
+            res = self.tmp()
+            self.lines.append(f"  {quot} = udiv i128 {num}, {d128}")
+            self.lines.append(f"  {res} = trunc i128 {quot} to i64")
+            return res
+
         if op == "bytes_eq4":
             buf_name = str(items[1].val)
             idx = self.emit_expr(items[2], env)
@@ -401,7 +613,7 @@ class FunctionIREmitter:
             for arg_node, pk in zip(items[2:], sig.param_kinds):
                 if pk in LINEAR_CAPS:
                     continue  # Zero-cost linear capability erasure!
-                if pk in ("slice", "mut_slice", "atomic_u64", "bytes"):
+                if pk in ("slice", "mut_slice", "atomic_u64", "bytes", "mut_bytes"):
                     ir_args.append(f"ptr {env[str(arg_node.val)]}")
                 elif pk.startswith(("struct:", "enum:")):
                     ir_args.append(f"{_ir_type_for_kind(pk)} {self.emit_expr(arg_node, env)}")
@@ -423,15 +635,25 @@ class FunctionIREmitter:
             return r
 
         args = [self.emit_expr(a, env) for a in items[1:]]
-        r = self.tmp()
         if op in ("==", "!=", "<", "<=", ">", ">="):
-            cmp_signed = (self._raw_kind(items[1]) == "i64") or (self._raw_kind(items[2]) == "i64")
+            rk1 = self._raw_kind(items[1])
+            rk2 = self._raw_kind(items[2])
+            if rk1.startswith(("struct:", "enum:")) and op in ("==", "!="):
+                eq_r = self._emit_aggregate_eq(args[0], args[1], rk1)
+                if op == "==":
+                    return eq_r
+                ne_r = self.tmp()
+                self.lines.append(f"  {ne_r} = xor i1 {eq_r}, true")
+                return ne_r
+            r = self.tmp()
+            cmp_signed = (rk1 == "i64") or (rk2 == "i64")
             if cmp_signed:
                 pred = {"==": "eq", "!=": "ne", "<": "slt", "<=": "sle", ">": "sgt", ">=": "sge"}[op]
             else:
                 pred = {"==": "eq", "!=": "ne", "<": "ult", "<=": "ule", ">": "ugt", ">=": "uge"}[op]
             self.lines.append(f"  {r} = icmp {pred} i64 {args[0]}, {args[1]}")
             return r
+        r = self.tmp()
 
         if op in ("and", "or"):
             lop = "and" if op == "and" else "or"
@@ -590,12 +812,18 @@ def emit_llvm_module(
         "declare i64 @llvm.bswap.i64(i64)",
     ]
 
-    for sdef in tenv.structs.values():
-        fields_ir = ", ".join("i64" for _ in sdef.fields)
-        header.append(f"%struct.{sdef.name} = type {{ {fields_ir} }}")
-    for edef in tenv.enums.values():
-        slots = ", ".join("i64" for _ in range(1 + edef.max_fields))
-        header.append(f"%enum.{edef.name} = type {{ {slots} }}")
+    type_order = tenv.type_order or (
+        [("struct", s) for s in tenv.structs] + [("enum", e) for e in tenv.enums]
+    )
+    for tkind, tname in type_order:
+        if tkind == "struct" and tname in tenv.structs:
+            sdef = tenv.structs[tname]
+            fields_ir = ", ".join(_ir_type_for_kind(fd.kind) for fd in sdef.fields) or "i64"
+            header.append(f"%struct.{sdef.name} = type {{ {fields_ir} }}")
+        elif tkind == "enum" and tname in tenv.enums:
+            edef = tenv.enums[tname]
+            slots = ", ".join("i64" for _ in range(1 + edef.max_payload_slots(tenv.structs, tenv.enums)))
+            header.append(f"%enum.{edef.name} = type {{ {slots} }}")
 
     body_blocks: list[str] = []
     exports: list[ExportedSymbol] = []
@@ -658,6 +886,13 @@ def emit_llvm_module(
                     ssa_ir_params.append(f"ptr noalias nocapture readonly noundef %{pname}")
                     c_ir_params.append(f"ptr noalias nocapture readonly noundef %{pname}")
                     c_params.append(("const uint8_t*", pname))
+                    py_params.append("ctypes.POINTER(ctypes.c_uint8)")
+                    param_struct_types.append(None)
+                elif pk == "mut_bytes":
+                    pure_mem = False
+                    ssa_ir_params.append(f"ptr noalias nocapture noundef %{pname}")
+                    c_ir_params.append(f"ptr noalias nocapture noundef %{pname}")
+                    c_params.append(("uint8_t*", pname))
                     py_params.append("ctypes.POINTER(ctypes.c_uint8)")
                     param_struct_types.append(None)
                 elif pk == "mut_slice":
@@ -758,7 +993,7 @@ def emit_llvm_module(
                         ename = pk.split(":", 1)[1]
                         wrap_lines.append(f"  %{pname}_val = load %enum.{ename}, ptr %{pname}_ptr, align 8")
                         call_args.append(f"%enum.{ename} %{pname}_val")
-                    elif pk in ("slice", "mut_slice", "atomic_u64", "bytes"):
+                    elif pk in ("slice", "mut_slice", "atomic_u64", "bytes", "mut_bytes"):
                         call_args.append(f"ptr %{pname}")
                     else:
                         call_args.append(f"i64 %{pname}")
@@ -827,9 +1062,11 @@ def emit_llvm_module(
                     ir_params.append(f"ptr noalias nocapture noundef %{pname}")
                     c_params.append(("int64_t*" if is_i64_el else "uint64_t*", pname))
                     py_params.append("ctypes.POINTER(ctypes.c_int64)" if is_i64_el else "ctypes.POINTER(ctypes.c_uint64)")
-                elif pk == "bytes":
-                    ir_params.append(f"ptr noalias nocapture readonly noundef %{pname}")
-                    c_params.append(("const uint8_t*", pname))
+                elif pk in ("bytes", "mut_bytes"):
+                    ro = " readonly" if pk == "bytes" else ""
+                    c_ty = "const uint8_t*" if pk == "bytes" else "uint8_t*"
+                    ir_params.append(f"ptr noalias nocapture{ro} noundef %{pname}")
+                    c_params.append((c_ty, pname))
                     py_params.append("ctypes.POINTER(ctypes.c_uint8)")
                 elif pk == "i64":
                     ir_params.append(f"i64 noundef %{pname}")
@@ -953,9 +1190,10 @@ def generate_c_header(
     exports: list[ExportedSymbol],
     structs: dict[str, StructDef] | None = None,
     enums: dict[str, EnumDef] | None = None,
+    type_order: list[tuple[str, str]] | None = None,
 ) -> str:
     lines = [
-        "/* Auto-generated by ailang v0.3 — Formally Verified C ABI Header */",
+        "/* Auto-generated by ailang v1.1 — Formally Verified C ABI Header */",
         "#pragma once",
         "#include <stdint.h>",
         "#ifdef __cplusplus",
@@ -963,22 +1201,33 @@ def generate_c_header(
         "#endif",
         "",
     ]
-    for sdef in (structs or {}).values():
-        lines.append("typedef struct {")
-        for fd in sdef.fields:
-            ct = "int64_t" if fd.kind == "i64" else "uint64_t"
-            lines.append(f"    {ct} {fd.name};")
-        lines.append(f"}} {sdef.name};\n")
-    for edef in (enums or {}).values():
-        lines.append("typedef enum {")
-        for vdef in edef.variants:
-            lines.append(f"    {edef.name}_{vdef.name} = {vdef.tag},")
-        lines.append(f"}} {edef.name}_Tag;\n")
-        lines.append("typedef struct {")
-        lines.append("    uint64_t tag;")
-        for p_idx in range(edef.max_fields):
-            lines.append(f"    uint64_t _p{p_idx};")
-        lines.append(f"}} {edef.name};\n")
+    s_map = structs or {}
+    e_map = enums or {}
+    order = type_order or ([("struct", s) for s in s_map] + [("enum", e) for e in e_map])
+    for tkind, tname in order:
+        if tkind == "struct" and tname in s_map:
+            sdef = s_map[tname]
+            lines.append("typedef struct {")
+            for fd in sdef.fields:
+                if fd.kind == "i64":
+                    ct = "int64_t"
+                elif fd.kind == "u64":
+                    ct = "uint64_t"
+                else:
+                    ct = fd.kind.split(":", 1)[1]
+                lines.append(f"    {ct} {fd.name};")
+            lines.append(f"}} {sdef.name};\n")
+        elif tkind == "enum" and tname in e_map:
+            edef = e_map[tname]
+            lines.append("typedef enum {")
+            for vdef in edef.variants:
+                lines.append(f"    {edef.name}_{vdef.name} = {vdef.tag},")
+            lines.append(f"}} {edef.name}_Tag;\n")
+            lines.append("typedef struct {")
+            lines.append("    uint64_t tag;")
+            for p_idx in range(edef.max_payload_slots(s_map, e_map)):
+                lines.append(f"    uint64_t _p{p_idx};")
+            lines.append(f"}} {edef.name};\n")
     for ex in exports:
         p_str = ", ".join(f"{t} {n}" for t, n in ex.params_c) or "void"
         lines.append(f"{ex.ret_c} {ex.name}({p_str});")
@@ -991,40 +1240,81 @@ def generate_python_bindings(
     lib_filename: str,
     structs: dict[str, StructDef] | None = None,
     enums: dict[str, EnumDef] | None = None,
+    type_order: list[tuple[str, str]] | None = None,
 ) -> str:
+    import keyword
+
+    def _py_ident(nm: str) -> str:
+        return f"{nm}_" if (keyword.iskeyword(nm) or nm in ("cls", "ctypes", "_LIB", "_out", "_slots", "_kw")) else nm
+
+    s_map = structs or {}
+    e_map = enums or {}
     lines = [
-        '"""Auto-generated by ailang v0.3 — Formally Verified Python ctypes Bindings."""',
+        '"""Auto-generated by ailang v1.1 — Formally Verified Python ctypes Bindings."""',
         "import ctypes",
         "from pathlib import Path",
         "",
         f'_LIB = ctypes.CDLL(str(Path(__file__).with_name("{lib_filename}")))',
         "",
     ]
-    for sdef in (structs or {}).values():
-        lines.append(f"class {sdef.name}(ctypes.Structure):")
-        lines.append("    _fields_ = [")
-        for fd in sdef.fields:
-            pyt = "ctypes.c_int64" if fd.kind == "i64" else "ctypes.c_uint64"
-            lines.append(f'        ("{fd.name}", {pyt}),')
-        lines.append("    ]\n")
-    for edef in (enums or {}).values():
-        lines.append(f"class {edef.name}(ctypes.Structure):")
-        lines.append("    _fields_ = [")
-        lines.append('        ("tag", ctypes.c_uint64),')
-        for p_idx in range(edef.max_fields):
-            lines.append(f'        ("_p{p_idx}", ctypes.c_uint64),')
-        lines.append("    ]")
-        for vdef in edef.variants:
-            lines.append(f"    TAG_{vdef.name} = {vdef.tag}")
-        for vdef in edef.variants:
-            params_s = ", ".join(["cls", *[fd.name for fd in vdef.fields]])
-            assigns = [f"tag={vdef.tag}"] + [f"_p{i}=({fd.name} & 0xFFFFFFFFFFFFFFFF)" for i, fd in enumerate(vdef.fields)]
-            lines.append("    @classmethod")
-            lines.append(f"    def {vdef.name}({params_s}):")
-            lines.append(f"        return cls({', '.join(assigns)})")
-        lines.append("    def field(self, idx: int, signed: bool = False) -> int:")
-        lines.append('        raw = getattr(self, f"_p{idx}")')
-        lines.append("        return raw - (1 << 64) if signed and raw >= (1 << 63) else raw\n")
+    if e_map:
+        lines.extend(
+            [
+                "def _ail_flatten_slots(v):",
+                "    if isinstance(v, ctypes.Structure):",
+                "        out = []",
+                "        for fnm, _ in v._fields_:",
+                "            out.extend(_ail_flatten_slots(getattr(v, fnm)))",
+                "        return out",
+                "    return [int(v) & 0xFFFFFFFFFFFFFFFF]",
+                "",
+            ]
+        )
+    order = type_order or ([("struct", s) for s in s_map] + [("enum", e) for e in e_map])
+    for tkind, tname in order:
+        if tkind == "struct" and tname in s_map:
+            sdef = s_map[tname]
+            lines.append(f"class {sdef.name}(ctypes.Structure):")
+            lines.append("    _fields_ = [")
+            for fd in sdef.fields:
+                if fd.kind == "i64":
+                    pyt = "ctypes.c_int64"
+                elif fd.kind == "u64":
+                    pyt = "ctypes.c_uint64"
+                else:
+                    pyt = fd.kind.split(":", 1)[1]
+                lines.append(f'        ("{fd.name}", {pyt}),')
+            lines.append("    ]\n")
+        elif tkind == "enum" and tname in e_map:
+            edef = e_map[tname]
+            lines.append(f"class {edef.name}(ctypes.Structure):")
+            lines.append("    _fields_ = [")
+            lines.append('        ("tag", ctypes.c_uint64),')
+            for p_idx in range(edef.max_payload_slots(s_map, e_map)):
+                lines.append(f'        ("_p{p_idx}", ctypes.c_uint64),')
+            lines.append("    ]")
+            for vdef in edef.variants:
+                lines.append(f"    TAG_{vdef.name} = {vdef.tag}")
+            for vdef in edef.variants:
+                safe_fnames = [_py_ident(fd.name) for fd in vdef.fields]
+                params_s = ", ".join(["cls", *safe_fnames])
+                lines.append("    @classmethod")
+                lines.append(f"    def {vdef.name}({params_s}):")
+                if not vdef.fields:
+                    lines.append(f"        return cls(tag={vdef.tag})")
+                elif all(fd.kind in ("u64", "i64") for fd in vdef.fields):
+                    assigns = [f"tag={vdef.tag}"] + [f"_p{i}=({snm} & 0xFFFFFFFFFFFFFFFF)" for i, snm in enumerate(safe_fnames)]
+                    lines.append(f"        return cls({', '.join(assigns)})")
+                else:
+                    slot_expr = " + ".join(f"_ail_flatten_slots({snm})" for snm in safe_fnames)
+                    lines.append(f"        _slots = {slot_expr}")
+                    lines.append(f"        _kw = {{'tag': {vdef.tag}}}")
+                    lines.append("        for _i, _sv in enumerate(_slots):")
+                    lines.append("            _kw[f'_p{_i}'] = _sv")
+                    lines.append("        return cls(**_kw)")
+            lines.append("    def field(self, idx: int, signed: bool = False) -> int:")
+            lines.append('        raw = getattr(self, f"_p{idx}")')
+            lines.append("        return raw - (1 << 64) if signed and raw >= (1 << 63) else raw\n")
 
     for ex in exports:
         lines.append(f"_LIB.{ex.name}.argtypes = [{', '.join(ex.params_py)}]")
@@ -1034,13 +1324,17 @@ def generate_python_bindings(
         if not has_struct and not has_bytes:
             lines.append(f"{ex.name} = _LIB.{ex.name}\n")
         else:
-            sig_args = ", ".join(ex.param_names)
+            safe_pnames = [_py_ident(pn) for pn in ex.param_names]
+            sig_args = ", ".join(safe_pnames)
             call_exprs: list[str] = []
-            for pn, st, pt in zip(ex.param_names, ex.param_struct_types, ex.params_py):
+            for pn, st, pt, pc in zip(safe_pnames, ex.param_struct_types, ex.params_py, ex.params_c):
                 if st is not None:
                     call_exprs.append(f"ctypes.byref({pn}) if isinstance({pn}, {st}) else {pn}")
                 elif pt == "ctypes.POINTER(ctypes.c_uint8)":
-                    call_exprs.append(f"((ctypes.c_uint8 * len({pn})).from_buffer_copy({pn}) if isinstance({pn}, (bytes, bytearray, memoryview)) else {pn})")
+                    if pc[0] == "uint8_t*":
+                        call_exprs.append(f"((ctypes.c_uint8 * len({pn})).from_buffer({pn}) if isinstance({pn}, (bytearray, memoryview)) else {pn})")
+                    else:
+                        call_exprs.append(f"((ctypes.c_uint8 * len({pn})).from_buffer_copy({pn}) if isinstance({pn}, (bytes, bytearray, memoryview)) else {pn})")
                 else:
                     call_exprs.append(pn)
             lines.append(f"def {ex.name}({sig_args}):")
@@ -1093,8 +1387,8 @@ def compile_llvm_to_native(
         subprocess.run(["clang", "-O3", "-shared", "-x", "ir", str(ll_path), "-o", str(bin_path)], check=True)
         h_path = out_dir / f"{stem}.h"
         py_path = out_dir / f"{stem}_bindings.py"
-        h_path.write_text(generate_c_header(exports, tenv.structs, tenv.enums))
-        py_path.write_text(generate_python_bindings(exports, bin_path.name, tenv.structs, tenv.enums))
+        h_path.write_text(generate_c_header(exports, tenv.structs, tenv.enums, tenv.type_order))
+        py_path.write_text(generate_python_bindings(exports, bin_path.name, tenv.structs, tenv.enums, tenv.type_order))
         return pb.BuildArtifacts(
             llvm_ir_path=str(ll_path),
             asm_path=str(s_path),
